@@ -103,9 +103,15 @@ func (q *Queries) DeleteWorkspaceAdministration(ctx context.Context, workspaceID
 }
 
 const deleteWorkspaceAgents = `-- name: DeleteWorkspaceAgents :exec
+WITH deleted_bindings AS (
+    DELETE FROM agent_runtime_binding WHERE agent_runtime_binding.workspace_id = $1
+)
 DELETE FROM agent WHERE agent.workspace_id = $1
 `
 
+// agent_runtime_binding is workspace-scoped and points at both agents and
+// runtimes; sweep it here (before the agent rows it references) so teardown
+// leaves no orphaned bindings.
 func (q *Queries) DeleteWorkspaceAgents(ctx context.Context, workspaceID pgtype.UUID) error {
 	_, err := q.db.Exec(ctx, deleteWorkspaceAgents, workspaceID)
 	return err
