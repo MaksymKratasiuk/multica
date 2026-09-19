@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -31,7 +33,7 @@ func TestParseTaskRetentionConfig(t *testing.T) {
 		}
 		if cfg.FailedDays != taskRetentionDefaultFailedDays ||
 			cfg.CompletedDays != taskRetentionDefaultCompletedDays ||
-			cfg.Interval != taskRetentionDefaultInterval ||
+			cfg.Cadence != taskRetentionDefaultCadence ||
 			cfg.BatchSize != taskRetentionDefaultBatchSize ||
 			!cfg.DryRun {
 			t.Fatalf("defaults not applied: %+v", cfg)
@@ -42,14 +44,14 @@ func TestParseTaskRetentionConfig(t *testing.T) {
 		cfg, err := parseTaskRetentionConfig(base(map[string]string{
 			envTaskRetentionFailedDays:    "10",
 			envTaskRetentionCompletedDays: "45",
-			envTaskRetentionInterval:      "6h",
+			envTaskRetentionCadence:       "6h",
 			envTaskRetentionBatchSize:     "250",
 			envTaskRetentionDryRun:        "false",
 		}))
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if cfg.FailedDays != 10 || cfg.CompletedDays != 45 || cfg.Interval != 6*time.Hour ||
+		if cfg.FailedDays != 10 || cfg.CompletedDays != 45 || cfg.Cadence != 6*time.Hour ||
 			cfg.BatchSize != 250 || cfg.DryRun {
 			t.Fatalf("overrides not applied: %+v", cfg)
 		}
@@ -76,8 +78,9 @@ func TestParseTaskRetentionConfig(t *testing.T) {
 		{"failed days negative", map[string]string{envTaskRetentionFailedDays: "-1"}},
 		{"completed days non-integer", map[string]string{envTaskRetentionCompletedDays: "x"}},
 		{"completed days zero", map[string]string{envTaskRetentionCompletedDays: "0"}},
-		{"interval unparseable", map[string]string{envTaskRetentionInterval: "soon"}},
-		{"interval non-positive", map[string]string{envTaskRetentionInterval: "0s"}},
+		{"cadence unparseable", map[string]string{envTaskRetentionCadence: "soon"}},
+		{"cadence non-positive", map[string]string{envTaskRetentionCadence: "0s"}},
+		{"cadence below one minute", map[string]string{envTaskRetentionCadence: "30s"}},
 		{"batch size zero", map[string]string{envTaskRetentionBatchSize: "0"}},
 		{"batch size over cap", map[string]string{envTaskRetentionBatchSize: "501"}},
 		{"batch size non-integer", map[string]string{envTaskRetentionBatchSize: "lots"}},
@@ -105,6 +108,7 @@ const retentionFarPastDays = 3650 // 10 years: guarantees a candidate sorts olde
 // transaction so the shared database is never mutated.
 type retentionEnv struct {
 	fx          *testutil.Fixture
+	runtimeID   string
 	agentID     string
 	autopilotID string
 }
@@ -112,7 +116,11 @@ type retentionEnv struct {
 func newRetentionEnv(t *testing.T) *retentionEnv {
 	t.Helper()
 	fx := testutil.New(testPool, testWorkspaceID, testUserID)
-	agentID := fx.Agent(t, "task-retention-agent", "")
+	// Every task carries a runtime_id so rows with a NULL completed_at still
+	// satisfy the agent_task_queue_active_requires_runtime CHECK (migration 251:
+	// runtime_id IS NOT NULL OR completed_at IS NOT NULL).
+	runtimeID := fx.Runtime(t, "task-retention-runtime")
+	agentID := fx.Agent(t, "task-retention-agent", runtimeID)
 	autopilotID := fx.Insert(t, "autopilot", testutil.Cols{
 		"workspace_id":    testWorkspaceID,
 		"title":           "task-retention-autopilot",
@@ -120,7 +128,7 @@ func newRetentionEnv(t *testing.T) *retentionEnv {
 		"created_by_type": "member",
 		"created_by_id":   testUserID,
 	})
-	return &retentionEnv{fx: fx, agentID: agentID, autopilotID: autopilotID}
+	return &retentionEnv{fx: fx, runtimeID: runtimeID, agentID: agentID, autopilotID: autopilotID}
 }
 
 // withRetentionTx runs fn inside a transaction that is always rolled back, so
@@ -160,9 +168,9 @@ func execID(t *testing.T, ctx context.Context, tx pgx.Tx, sql string, args ...an
 func (e *retentionEnv) insertTask(t *testing.T, ctx context.Context, tx pgx.Tx, status, completedAtExpr string) string {
 	t.Helper()
 	sql := fmt.Sprintf(
-		"INSERT INTO agent_task_queue (agent_id, status, priority, completed_at) VALUES ($1, $2, 0, %s) RETURNING id",
+		"INSERT INTO agent_task_queue (agent_id, runtime_id, status, priority, completed_at) VALUES ($1, $2, $3, 0, %s) RETURNING id",
 		completedAtExpr)
-	return execID(t, ctx, tx, sql, e.agentID, status)
+	return execID(t, ctx, tx, sql, e.agentID, e.runtimeID, status)
 }
 
 // agedExpr builds a completed_at expression exactly `days` before asOf using
@@ -419,8 +427,8 @@ func TestTaskRetentionChildLineageGuard(t *testing.T) {
 		withChild := func(childStatus string) string {
 			parent := env.insertTask(t, ctx, tx, "failed", old)
 			execID(t, ctx, tx,
-				"INSERT INTO agent_task_queue (agent_id, status, priority, parent_task_id) VALUES ($1, $2, 0, $3) RETURNING id",
-				env.agentID, childStatus, parent)
+				"INSERT INTO agent_task_queue (agent_id, runtime_id, status, priority, parent_task_id) VALUES ($1, $2, $3, 0, $4) RETURNING id",
+				env.agentID, env.runtimeID, childStatus, parent)
 			return parent
 		}
 
@@ -440,8 +448,8 @@ func TestTaskRetentionChildLineageGuard(t *testing.T) {
 			"INSERT INTO agent_task_queue (agent_id, status, priority, completed_at, parent_task_id) VALUES ($1, 'failed', 0, "+old+", $2) RETURNING id",
 			env.agentID, grandparent)
 		execID(t, ctx, tx,
-			"INSERT INTO agent_task_queue (agent_id, status, priority, parent_task_id) VALUES ($1, 'running', 0, $2) RETURNING id",
-			env.agentID, midParent)
+			"INSERT INTO agent_task_queue (agent_id, runtime_id, status, priority, parent_task_id) VALUES ($1, $2, 'running', 0, $3) RETURNING id",
+			env.agentID, env.runtimeID, midParent)
 
 		ids, err := qtx.DeleteFailedTaskRetentionBatch(ctx, db.DeleteFailedTaskRetentionBatchParams{
 			AsOf: asOf, FailedDays: 30, BatchSize: taskRetentionMaxBatchSize,
@@ -599,7 +607,7 @@ func TestTaskRetentionDryRunRoundZeroDeletes(t *testing.T) {
 	cfg := taskRetentionConfig{
 		FailedDays:    taskRetentionDefaultFailedDays,
 		CompletedDays: taskRetentionDefaultCompletedDays,
-		Interval:      taskRetentionDefaultInterval,
+		Cadence:       taskRetentionDefaultCadence,
 		BatchSize:     taskRetentionDefaultBatchSize,
 		DryRun:        true,
 	}
@@ -640,7 +648,7 @@ func TestTaskRetentionDeleteRoundDrains(t *testing.T) {
 	cfg := taskRetentionConfig{
 		FailedDays:    taskRetentionDefaultFailedDays,
 		CompletedDays: taskRetentionDefaultCompletedDays,
-		Interval:      taskRetentionDefaultInterval,
+		Cadence:       taskRetentionDefaultCadence,
 		BatchSize:     taskRetentionDefaultBatchSize,
 		DryRun:        false,
 	}
@@ -660,4 +668,309 @@ func TestTaskRetentionDeleteRoundDrains(t *testing.T) {
 	if n := fx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE id = $1", freshID); n != 1 {
 		t.Errorf("idempotent rerun purged the fresh row (count=%d)", n)
 	}
+}
+
+// deleteRoundCfg is the delete-mode config shared by the committed-fixture cases
+// below (dry-run off, defaults otherwise).
+func deleteRoundCfg() taskRetentionConfig {
+	return taskRetentionConfig{
+		FailedDays:    taskRetentionDefaultFailedDays,
+		CompletedDays: taskRetentionDefaultCompletedDays,
+		Cadence:       taskRetentionDefaultCadence,
+		BatchSize:     taskRetentionDefaultBatchSize,
+		DryRun:        false,
+	}
+}
+
+// failedRetentionStage builds the failed-status stage the sweeper uses, so a
+// test can drive deleteTaskRetentionBatch directly with the real query.
+func failedRetentionStage(cfg taskRetentionConfig, queries *db.Queries) taskRetentionStage {
+	return taskRetentionStage{
+		status: obsmetrics.TaskRetentionStatusFailed,
+		count: func(ctx context.Context, asOf pgtype.Timestamptz) (int64, error) {
+			return queries.CountFailedTaskRetentionCandidates(ctx, db.CountFailedTaskRetentionCandidatesParams{
+				AsOf: asOf, FailedDays: cfg.FailedDays,
+			})
+		},
+		deleteBatch: func(ctx context.Context, qtx *db.Queries, asOf pgtype.Timestamptz) ([]pgtype.UUID, error) {
+			return qtx.DeleteFailedTaskRetentionBatch(ctx, db.DeleteFailedTaskRetentionBatchParams{
+				AsOf: asOf, FailedDays: cfg.FailedDays, BatchSize: cfg.BatchSize,
+			})
+		},
+	}
+}
+
+// TestTaskRetentionSkipLockedRetries proves FOR UPDATE ... SKIP LOCKED: a
+// candidate another transaction holds locked is skipped (not blocked on and not
+// deleted) in the first batch, then deleted in a later batch once the lock is
+// released — the drain resumes rather than losing the row.
+func TestTaskRetentionSkipLockedRetries(t *testing.T) {
+	requireDBTest(t)
+	fx := testutil.New(testPool, testWorkspaceID, testUserID)
+	runtimeID := fx.Runtime(t, "task-retention-skiplocked-runtime")
+	agentID := fx.Agent(t, "task-retention-skiplocked-agent", runtimeID)
+
+	aged := testutil.Cols{
+		"status":       "failed",
+		"runtime_id":   runtimeID,
+		"completed_at": testutil.Raw("now() - interval '3650 days'"),
+	}
+	locked := fx.Task(t, agentID, aged)
+	other := fx.Task(t, agentID, aged)
+
+	ctx := context.Background()
+	queries := db.New(testPool)
+	asOf, err := queries.GetTaskRetentionAsOf(ctx)
+	if err != nil {
+		t.Fatalf("read DB clock: %v", err)
+	}
+	cfg := deleteRoundCfg()
+	stage := failedRetentionStage(cfg, queries)
+
+	// Hold a row lock on `locked` from a separate connection.
+	lockTx, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin lock tx: %v", err)
+	}
+	lockReleased := false
+	defer func() {
+		if !lockReleased {
+			_ = lockTx.Rollback(ctx)
+		}
+	}()
+	if _, err := lockTx.Exec(ctx, "SELECT id FROM agent_task_queue WHERE id = $1 FOR UPDATE", locked); err != nil {
+		t.Fatalf("lock row: %v", err)
+	}
+
+	// First batch: the locked row must be skipped, the other deleted.
+	if _, err := deleteTaskRetentionBatch(ctx, testPool, queries, cfg, asOf, stage); err != nil {
+		t.Fatalf("first batch: %v", err)
+	}
+	if n := fx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE id = $1", locked); n != 1 {
+		t.Errorf("SKIP LOCKED failed: locked row was deleted (count=%d)", n)
+	}
+	if n := fx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE id = $1", other); n != 0 {
+		t.Errorf("first batch did not delete the unlocked row (count=%d)", n)
+	}
+
+	// Release the lock; the previously-skipped row is now deletable.
+	if err := lockTx.Rollback(ctx); err != nil {
+		t.Fatalf("release lock: %v", err)
+	}
+	lockReleased = true
+
+	if _, err := deleteTaskRetentionBatch(ctx, testPool, queries, cfg, asOf, stage); err != nil {
+		t.Fatalf("second batch: %v", err)
+	}
+	if n := fx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE id = $1", locked); n != 0 {
+		t.Errorf("previously-locked row survived after the lock was released (count=%d)", n)
+	}
+}
+
+// TestTaskRetentionBatchFailureRollsBackAndResumes proves fail-stop with a clean
+// rollback: when a batch's delete succeeds but the surrounding operation then
+// fails, the whole batch transaction rolls back (the rows and their cascaded
+// usage survive) and the error propagates instead of being swallowed. A later
+// clean round then purges the same rows — the failure deferred nothing silently.
+func TestTaskRetentionBatchFailureRollsBackAndResumes(t *testing.T) {
+	requireDBTest(t)
+	fx := testutil.New(testPool, testWorkspaceID, testUserID)
+	runtimeID := fx.Runtime(t, "task-retention-failstop-runtime")
+	agentID := fx.Agent(t, "task-retention-failstop-agent", runtimeID)
+
+	taskID := fx.Task(t, agentID, testutil.Cols{
+		"status":       "failed",
+		"runtime_id":   runtimeID,
+		"completed_at": testutil.Raw("now() - interval '3650 days'"),
+	})
+	// A usage row makes the rollback observable on a cascaded dependent too.
+	fx.Exec(t, "INSERT INTO task_usage (task_id, provider, model, output_tokens) VALUES ($1, 'test-provider', 'failstop-model', 5)", taskID)
+	fx.Cleanup(t, "DELETE FROM task_usage WHERE task_id = $1", taskID)
+
+	ctx := context.Background()
+	queries := db.New(testPool)
+	asOf, err := queries.GetTaskRetentionAsOf(ctx)
+	if err != nil {
+		t.Fatalf("read DB clock: %v", err)
+	}
+	cfg := deleteRoundCfg()
+
+	injected := errors.New("injected batch failure")
+	failing := taskRetentionStage{
+		status: obsmetrics.TaskRetentionStatusFailed,
+		count: func(ctx context.Context, asOf pgtype.Timestamptz) (int64, error) {
+			return queries.CountFailedTaskRetentionCandidates(ctx, db.CountFailedTaskRetentionCandidatesParams{
+				AsOf: asOf, FailedDays: cfg.FailedDays,
+			})
+		},
+		deleteBatch: func(ctx context.Context, qtx *db.Queries, asOf pgtype.Timestamptz) ([]pgtype.UUID, error) {
+			// Do the real delete, then fail: the batch tx must roll back so the
+			// rows reappear and no partial purge is committed.
+			if _, err := qtx.DeleteFailedTaskRetentionBatch(ctx, db.DeleteFailedTaskRetentionBatchParams{
+				AsOf: asOf, FailedDays: cfg.FailedDays, BatchSize: cfg.BatchSize,
+			}); err != nil {
+				return nil, err
+			}
+			return nil, injected
+		},
+	}
+
+	err = runTaskRetentionStage(ctx, testPool, queries, obsmetrics.NewBusinessMetrics(), cfg, asOf, failing)
+	if !errors.Is(err, injected) {
+		t.Fatalf("expected injected error to propagate (fail-stop), got %v", err)
+	}
+	if n := fx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE id = $1", taskID); n != 1 {
+		t.Errorf("batch failure did not roll back: task count=%d", n)
+	}
+	if n := fx.Count(t, "SELECT count(*) FROM task_usage WHERE task_id = $1", taskID); n != 1 {
+		t.Errorf("batch failure did not roll back the cascade: task_usage count=%d", n)
+	}
+
+	// A clean round now purges the rows the failed round left behind.
+	sweepTaskRetention(ctx, testPool, queries, obsmetrics.NewBusinessMetrics(), cfg)
+	if n := fx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE id = $1", taskID); n != 0 {
+		t.Errorf("clean round did not resume purge (task count=%d)", n)
+	}
+}
+
+// TestTaskRetentionDeleteCascadesUsageAndEnqueuesDirty proves the delete's two
+// dependent effects: task_usage rows cascade away (FK ON DELETE CASCADE,
+// migration 032), and the BEFORE DELETE trigger (migration 102/243) enqueues an
+// hourly-dirty row so the usage rollup re-derives the vanished usage.
+func TestTaskRetentionDeleteCascadesUsageAndEnqueuesDirty(t *testing.T) {
+	requireDBTest(t)
+	env := newRetentionEnv(t)
+
+	env.withRetentionTx(t, func(ctx context.Context, tx pgx.Tx, qtx *db.Queries, asOf pgtype.Timestamptz, iso string) {
+		taskID := env.insertTask(t, ctx, tx, "failed", agedExpr(iso, retentionFarPastDays))
+		const model = "task-retention-cascade-model"
+		execID(t, ctx, tx,
+			"INSERT INTO task_usage (task_id, provider, model, output_tokens) VALUES ($1, 'test-provider', $2, 7) RETURNING id",
+			taskID, model)
+
+		ids, err := qtx.DeleteFailedTaskRetentionBatch(ctx, db.DeleteFailedTaskRetentionBatchParams{
+			AsOf: asOf, FailedDays: 30, BatchSize: taskRetentionMaxBatchSize,
+		})
+		if err != nil {
+			t.Fatalf("delete failed batch: %v", err)
+		}
+		if !deletedSet(t, ids)[taskID] {
+			t.Fatalf("aged failed task with usage was not deleted")
+		}
+
+		var taskCount, usageCount, dirtyCount int
+		if err := tx.QueryRow(ctx, "SELECT count(*) FROM agent_task_queue WHERE id = $1", taskID).Scan(&taskCount); err != nil {
+			t.Fatalf("count task: %v", err)
+		}
+		if taskCount != 0 {
+			t.Errorf("task row survived delete (count=%d)", taskCount)
+		}
+		if err := tx.QueryRow(ctx, "SELECT count(*) FROM task_usage WHERE task_id = $1", taskID).Scan(&usageCount); err != nil {
+			t.Fatalf("count usage: %v", err)
+		}
+		if usageCount != 0 {
+			t.Errorf("task_usage row not cascade-deleted (count=%d)", usageCount)
+		}
+		if err := tx.QueryRow(ctx,
+			"SELECT count(*) FROM task_usage_hourly_dirty WHERE runtime_id = $1 AND agent_id = $2 AND model = $3",
+			env.runtimeID, env.agentID, model).Scan(&dirtyCount); err != nil {
+			t.Fatalf("count dirty: %v", err)
+		}
+		if dirtyCount == 0 {
+			t.Errorf("BEFORE DELETE trigger did not enqueue an hourly-dirty row for the purged usage")
+		}
+	})
+}
+
+// TestTaskRetentionDryRunCandidateParity proves the dry-run count matches what a
+// real delete would remove: the failed-candidate count rises by exactly the
+// number of newly-eligible rows, and the delete removes precisely those rows
+// while the age/status/guard-excluded rows are neither counted nor deleted.
+func TestTaskRetentionDryRunCandidateParity(t *testing.T) {
+	requireDBTest(t)
+	env := newRetentionEnv(t)
+
+	env.withRetentionTx(t, func(ctx context.Context, tx pgx.Tx, qtx *db.Queries, asOf pgtype.Timestamptz, iso string) {
+		countFailed := func() int64 {
+			n, err := qtx.CountFailedTaskRetentionCandidates(ctx, db.CountFailedTaskRetentionCandidatesParams{
+				AsOf: asOf, FailedDays: 30,
+			})
+			if err != nil {
+				t.Fatalf("count candidates: %v", err)
+			}
+			return n
+		}
+		base := countFailed()
+
+		old := agedExpr(iso, retentionFarPastDays)
+		deletable := map[string]bool{}
+		for i := 0; i < 3; i++ {
+			deletable[env.insertTask(t, ctx, tx, "failed", old)] = true
+		}
+		// Excluded from the candidate count: too new, wrong status, guarded by an
+		// active autopilot run.
+		env.insertTask(t, ctx, tx, "failed", agedExpr(iso, 29))
+		env.insertTask(t, ctx, tx, "completed", old)
+		guarded := env.insertTask(t, ctx, tx, "failed", old)
+		env.insertRun(t, ctx, tx, "running", old, &guarded)
+
+		if delta := countFailed() - base; delta != 3 {
+			t.Fatalf("candidate count delta = %d, want 3 (dry-run/delete parity broken)", delta)
+		}
+
+		ids, err := qtx.DeleteFailedTaskRetentionBatch(ctx, db.DeleteFailedTaskRetentionBatchParams{
+			AsOf: asOf, FailedDays: 30, BatchSize: taskRetentionMaxBatchSize,
+		})
+		if err != nil {
+			t.Fatalf("delete failed batch: %v", err)
+		}
+		got := deletedSet(t, ids)
+		for id := range deletable {
+			if !got[id] {
+				t.Errorf("parity: counted-deletable row %s was not deleted", id)
+			}
+		}
+		if got[guarded] {
+			t.Errorf("parity: guarded row was deleted but never counted")
+		}
+	})
+}
+
+// TestTaskRetentionPlanUsesTerminalIndex proves the failed-candidate predicate
+// is served by migration 261's partial index
+// (idx_agent_task_queue_terminal_completed_at_v2) rather than a full-table scan,
+// which is what keeps the sweep from scanning the whole lifetime table.
+func TestTaskRetentionPlanUsesTerminalIndex(t *testing.T) {
+	requireDBTest(t)
+	env := newRetentionEnv(t)
+
+	env.withRetentionTx(t, func(ctx context.Context, tx pgx.Tx, qtx *db.Queries, asOf pgtype.Timestamptz, iso string) {
+		// A small test table can make a seq scan look cheapest; disabling it
+		// asserts the index is usable at all, which is the property that matters
+		// at production scale.
+		if _, err := tx.Exec(ctx, "SET LOCAL enable_seqscan = off"); err != nil {
+			t.Fatalf("disable seqscan: %v", err)
+		}
+		rows, err := tx.Query(ctx,
+			"EXPLAIN SELECT id FROM agent_task_queue WHERE status = 'failed' AND completed_at IS NOT NULL AND completed_at < now() - make_interval(days => 30)")
+		if err != nil {
+			t.Fatalf("explain: %v", err)
+		}
+		defer rows.Close()
+		var plan strings.Builder
+		for rows.Next() {
+			var line string
+			if err := rows.Scan(&line); err != nil {
+				t.Fatalf("scan plan line: %v", err)
+			}
+			plan.WriteString(line)
+			plan.WriteByte('\n')
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatalf("plan rows: %v", err)
+		}
+		if !strings.Contains(plan.String(), "idx_agent_task_queue_terminal_completed_at_v2") {
+			t.Errorf("failed-candidate query did not use the terminal completed_at index; plan:\n%s", plan.String())
+		}
+	})
 }

@@ -28,8 +28,13 @@ import (
 const (
 	taskRetentionDefaultFailedDays    int32 = 30
 	taskRetentionDefaultCompletedDays int32 = 90
-	taskRetentionDefaultInterval            = 24 * time.Hour
+	taskRetentionDefaultCadence             = 24 * time.Hour
 	taskRetentionDefaultBatchSize     int32 = 500
+	// taskRetentionMinCadence is the smallest accepted sweep cadence. A
+	// sub-minute cadence would churn the advisory lock and round loop far
+	// faster than a retention sweep can ever need; reject it fail-closed
+	// rather than honor a value like "500ms".
+	taskRetentionMinCadence = 1 * time.Minute
 	// taskRetentionMaxBatchSize is a hard cap: a larger configured batch is a
 	// destructive-config error, not a value we silently clamp. A single batch
 	// runs inside one short transaction, so the cap bounds both lock hold time
@@ -59,16 +64,16 @@ const (
 
 	// Bounded backoff for the case where a batch deletes nothing yet candidates
 	// remain (all victims were SKIP LOCKED by concurrent work). The round
-	// timeout is the outer bound; this caps wasted retries within it.
-	taskRetentionInitialBackoff      = 100 * time.Millisecond
-	taskRetentionMaxBackoff          = 5 * time.Second
-	taskRetentionMaxContendedRetries = 5
+	// timeout is the outer bound; the backoff caps how fast the round retries a
+	// fully-contended snapshot until it drains or the round context expires.
+	taskRetentionInitialBackoff = 100 * time.Millisecond
+	taskRetentionMaxBackoff     = 5 * time.Second
 )
 
 const (
 	envTaskRetentionFailedDays    = "MULTICA_TASK_RETENTION_FAILED_DAYS"
 	envTaskRetentionCompletedDays = "MULTICA_TASK_RETENTION_COMPLETED_DAYS"
-	envTaskRetentionInterval      = "MULTICA_TASK_RETENTION_INTERVAL"
+	envTaskRetentionCadence       = "MULTICA_TASK_RETENTION_CADENCE"
 	envTaskRetentionBatchSize     = "MULTICA_TASK_RETENTION_BATCH_SIZE"
 	envTaskRetentionDryRun        = "MULTICA_TASK_RETENTION_DRY_RUN"
 )
@@ -76,7 +81,7 @@ const (
 type taskRetentionConfig struct {
 	FailedDays    int32
 	CompletedDays int32
-	Interval      time.Duration
+	Cadence       time.Duration
 	BatchSize     int32
 	DryRun        bool
 }
@@ -89,7 +94,7 @@ func parseTaskRetentionConfig(getenv func(string) string) (taskRetentionConfig, 
 	cfg := taskRetentionConfig{
 		FailedDays:    taskRetentionDefaultFailedDays,
 		CompletedDays: taskRetentionDefaultCompletedDays,
-		Interval:      taskRetentionDefaultInterval,
+		Cadence:       taskRetentionDefaultCadence,
 		BatchSize:     taskRetentionDefaultBatchSize,
 		DryRun:        true,
 	}
@@ -108,12 +113,12 @@ func parseTaskRetentionConfig(getenv func(string) string) (taskRetentionConfig, 
 		}
 		cfg.CompletedDays = int32(v)
 	}
-	if raw := getenv(envTaskRetentionInterval); raw != "" {
+	if raw := getenv(envTaskRetentionCadence); raw != "" {
 		v, err := time.ParseDuration(raw)
-		if err != nil || v <= 0 {
-			return cfg, fmt.Errorf("%s must be a positive duration, got %q", envTaskRetentionInterval, raw)
+		if err != nil || v < taskRetentionMinCadence {
+			return cfg, fmt.Errorf("%s must be a duration >= %s, got %q", envTaskRetentionCadence, taskRetentionMinCadence, raw)
 		}
-		cfg.Interval = v
+		cfg.Cadence = v
 	}
 	if raw := getenv(envTaskRetentionBatchSize); raw != "" {
 		v, err := strconv.Atoi(raw)
@@ -133,17 +138,17 @@ func parseTaskRetentionConfig(getenv func(string) string) (taskRetentionConfig, 
 }
 
 // runTaskRetentionSweeper runs one bounded retention round per configured
-// interval. It reuses runPeriodicSweep so overlapping ticks are dropped rather
+// cadence. It reuses runPeriodicSweep so overlapping ticks are dropped rather
 // than stacked, matching the runtime GC sweeper.
 func runTaskRetentionSweeper(ctx context.Context, pool *pgxpool.Pool, queries *db.Queries, metrics *obsmetrics.BusinessMetrics, cfg taskRetentionConfig) {
 	slog.Info("task retention sweeper started",
 		"failed_days", cfg.FailedDays,
 		"completed_days", cfg.CompletedDays,
-		"interval", cfg.Interval.String(),
+		"cadence", cfg.Cadence.String(),
 		"batch_size", cfg.BatchSize,
 		"dry_run", cfg.DryRun,
 	)
-	runPeriodicSweep(ctx, cfg.Interval, func() {
+	runPeriodicSweep(ctx, cfg.Cadence, func() {
 		sweepTaskRetention(ctx, pool, queries, metrics, cfg)
 	})
 }
@@ -264,7 +269,6 @@ func runTaskRetentionStage(ctx context.Context, pool *pgxpool.Pool, queries *db.
 
 	purged := 0
 	backoff := taskRetentionInitialBackoff
-	contended := 0
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -277,7 +281,6 @@ func runTaskRetentionStage(ctx context.Context, pool *pgxpool.Pool, queries *db.
 			purged += deleted
 			metrics.RecordTaskRetentionPurged(stage.status, deleted)
 			backoff = taskRetentionInitialBackoff
-			contended = 0
 			continue
 		}
 
@@ -290,12 +293,13 @@ func runTaskRetentionStage(ctx context.Context, pool *pgxpool.Pool, queries *db.
 		if remaining == 0 {
 			break
 		}
-		contended++
-		if contended > taskRetentionMaxContendedRetries {
-			slog.Warn("task retention: candidates remain but rows are locked; leaving for next round",
-				"status", stage.status, "remaining", remaining, "purged", purged)
-			break
-		}
+
+		// Candidates remain but every one was locked this pass. Back off and
+		// retry within the round context instead of silently deferring aged rows
+		// to the next daily run. The round timeout is the only bound: if it
+		// expires first, the ctx.Err() check at the top of the loop ends the
+		// round as a failure (fail-stop), never a success that leaves eligible
+		// rows behind.
 		if err := sleepWithContext(ctx, backoff); err != nil {
 			return err
 		}
