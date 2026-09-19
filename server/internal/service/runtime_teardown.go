@@ -133,6 +133,13 @@ func TeardownRuntime(ctx context.Context, qtx *db.Queries, runtimeID pgtype.UUID
 		}
 	}
 
+	// The runtime's provider circuit(s) describe a hold on a runtime that no
+	// longer exists; drop them so a re-created runtime does not inherit a stale
+	// open breaker.
+	if err := qtx.DeleteRuntimeProviderCircuitsByRuntime(ctx, runtimeID); err != nil {
+		return out, fmt.Errorf("remove runtime provider circuits: %w", err)
+	}
+
 	unbound, err := qtx.UnbindUserAgentsFromRuntime(ctx, runtimeID)
 	if err != nil {
 		return out, fmt.Errorf("unbind agents: %w", err)

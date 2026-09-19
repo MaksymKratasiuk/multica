@@ -1265,6 +1265,26 @@ type RuntimeProfile struct {
 	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
 }
 
+type RuntimeProviderCircuit struct {
+	ID                 pgtype.UUID        `json:"id"`
+	WorkspaceID        pgtype.UUID        `json:"workspace_id"`
+	RuntimeID          pgtype.UUID        `json:"runtime_id"`
+	Provider           string             `json:"provider"`
+	State              string             `json:"state"`
+	Generation         int64              `json:"generation"`
+	Reason             pgtype.Text        `json:"reason"`
+	OpenedAt           pgtype.Timestamptz `json:"opened_at"`
+	ResetAt            pgtype.Timestamptz `json:"reset_at"`
+	FailureCompletedAt pgtype.Timestamptz `json:"failure_completed_at"`
+	FailureTaskID      pgtype.UUID        `json:"failure_task_id"`
+	SuccessCompletedAt pgtype.Timestamptz `json:"success_completed_at"`
+	SuccessTaskID      pgtype.UUID        `json:"success_task_id"`
+	ProbeTaskID        pgtype.UUID        `json:"probe_task_id"`
+	ProbeExpiresAt     pgtype.Timestamptz `json:"probe_expires_at"`
+	CreatedAt          pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt          pgtype.Timestamptz `json:"updated_at"`
+}
+
 type SeatCapacityOutbox struct {
 	WorkspaceID    pgtype.UUID        `json:"workspace_id"`
 	OperationToken pgtype.UUID        `json:"operation_token"`
