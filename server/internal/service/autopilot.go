@@ -722,7 +722,16 @@ func (s *AutopilotService) dispatchCreateIssue(ctx context.Context, ap db.Autopi
 		case fallbackAuthHeld:
 			return &errDispatchSkipped{reason: poolAuthHeldReason(ap, decision), code: dispatch.ReasonDeferred}
 		case fallbackNoneAvailable:
-			return &errDispatchSkipped{reason: formatAdmissionReason(ap, firstVerdict.Detail), code: firstVerdict.Reason}
+			// No binding is circuit-held, but none is ready right now (e.g. the
+			// home runtime is offline). Unlike run_only, create_issue must NOT
+			// skip here: the WS-1325 audit-trail contract requires a visible
+			// issue to still be created so the task is claimed once the runtime
+			// comes back, instead of silently recording an unrecoverable skipped
+			// run. Only a circuit hold (auth/all-held) or a genuinely empty pool
+			// is doomed enough to skip; a transient not-ready home runtime falls
+			// through with selectedRuntime unchanged (the primary), preserving
+			// the pre-F5 behaviour.
+			_ = firstVerdict
 		}
 	}
 
