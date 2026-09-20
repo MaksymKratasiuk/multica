@@ -410,6 +410,13 @@ type AgentTaskResponse struct {
 	StartedAt            *string               `json:"started_at"`
 	CompletedAt          *string               `json:"completed_at"`
 	Result               any                   `json:"result"`
+	// DispatchRuntimeAudit is the never-silent evidence for an automatic runtime
+	// failover on a run_only dispatch (SE-37711 / SE-37664 F6): source/target
+	// runtime+provider, the ordered pool with each binding's hold facts, and the
+	// per-execution model action. Absent on ordinary dispatches, so omitempty
+	// keeps it out of the common task snapshot; passed through raw so the audit
+	// schema can evolve without a server roundtrip.
+	DispatchRuntimeAudit json.RawMessage `json:"dispatch_runtime_audit,omitempty"`
 	Error                *string               `json:"error"`
 	FailureReason        string                `json:"failure_reason,omitempty"` // see TaskService.MaybeRetryFailedTask
 	Attempt              int32                 `json:"attempt"`
@@ -845,6 +852,7 @@ func taskToResponse(t db.AgentTaskQueue, workspaceID string) AgentTaskResponse {
 		StartedAt:              timestampToPtr(t.StartedAt),
 		CompletedAt:            timestampToPtr(t.CompletedAt),
 		Result:                 result,
+		DispatchRuntimeAudit:   json.RawMessage(t.DispatchRuntimeAudit),
 		Error:                  textToPtr(t.Error),
 		FailureReason:          failureReason,
 		BranchName:             branchName,
@@ -2281,7 +2289,23 @@ func (h *Handler) UpdateAgent(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	updated, err := h.Queries.UpdateAgent(r.Context(), params)
+	// Projection + nullable clears + ordered pool + invocation targets all land
+	// in ONE transaction under the binding FOR UPDATE lock (SE-37741 F2). A
+	// partial apply used to be observable: the row projection committed on its
+	// own, then the pool replace / clear and the invocation-target rewrite ran
+	// in separate transactions, so a failure between them left runtime_id
+	// pointing at a runtime the binding rows no longer backed (invariant I3),
+	// or a half-cleared / half-permissioned agent. Mirror CreateAgent: one qtx,
+	// commit last, rollback on any error.
+	tx, err := h.TxStarter.Begin(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to start agent update transaction")
+		return
+	}
+	defer tx.Rollback(r.Context())
+	qtx := h.Queries.WithTx(tx)
+
+	updated, err := qtx.UpdateAgent(r.Context(), params)
 	if err != nil {
 		// Unique constraint on (workspace_id, name) — mirror CreateAgent and
 		// return a clear conflict instead of a 500 that leaks the raw
@@ -2307,7 +2331,7 @@ func (h *Handler) UpdateAgent(w http.ResponseWriter, r *http.Request) {
 	// clear the field. COALESCE in UpdateAgent cannot set a column to NULL, so
 	// mcp_config, thinking_level, and service_tier use dedicated clear queries.
 	if shouldClearMcpConfig {
-		updated, err = h.Queries.ClearAgentMcpConfig(r.Context(), updated.ID)
+		updated, err = qtx.ClearAgentMcpConfig(r.Context(), updated.ID)
 		if err != nil {
 			slog.Warn("clear agent mcp_config failed", append(logger.RequestAttrs(r), "error", err, "agent_id", id)...)
 			writeError(w, http.StatusInternalServerError, "failed to clear mcp_config: "+err.Error())
@@ -2315,7 +2339,7 @@ func (h *Handler) UpdateAgent(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if shouldClearThinkingLevel {
-		updated, err = h.Queries.ClearAgentThinkingLevel(r.Context(), updated.ID)
+		updated, err = qtx.ClearAgentThinkingLevel(r.Context(), updated.ID)
 		if err != nil {
 			slog.Warn("clear agent thinking_level failed", append(logger.RequestAttrs(r), "error", err, "agent_id", id)...)
 			writeError(w, http.StatusInternalServerError, "failed to clear thinking_level: "+err.Error())
@@ -2323,7 +2347,7 @@ func (h *Handler) UpdateAgent(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if shouldClearServiceTier {
-		updated, err = h.Queries.ClearAgentServiceTier(r.Context(), updated.ID)
+		updated, err = qtx.ClearAgentServiceTier(r.Context(), updated.ID)
 		if err != nil {
 			slog.Warn("clear agent service_tier failed", append(logger.RequestAttrs(r), "error", err, "agent_id", id)...)
 			writeError(w, http.StatusInternalServerError, "failed to clear service_tier: "+err.Error())
@@ -2331,7 +2355,7 @@ func (h *Handler) UpdateAgent(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if shouldClearComposioAllowlist {
-		updated, err = h.Queries.ClearAgentComposioToolkitAllowlist(r.Context(), updated.ID)
+		updated, err = qtx.ClearAgentComposioToolkitAllowlist(r.Context(), updated.ID)
 		if err != nil {
 			slog.Warn("clear agent composio_toolkit_allowlist failed", append(logger.RequestAttrs(r), "error", err, "agent_id", id)...)
 			writeError(w, http.StatusInternalServerError, "failed to clear composio_toolkit_allowlist: "+err.Error())
@@ -2342,17 +2366,17 @@ func (h *Handler) UpdateAgent(w http.ResponseWriter, r *http.Request) {
 	// Runtime pool (SE-37711 / SE-37664): the row update above already moved the
 	// legacy runtime_id projection to the priority-0 runtime (set) or a clear is
 	// handled here. Replace the ordered binding rows to match, or empty them and
-	// null the projection together. Done after the row update so the projection
-	// and the pool land in the same order the response reads them back.
+	// null the projection together — same transaction so the projection and the
+	// pool are never observed out of step (invariant I3).
 	switch poolIntent {
 	case runtimePoolSet:
-		if err := h.replaceAgentRuntimePool(r.Context(), updated.WorkspaceID, updated.ID, runtimePool); err != nil {
+		if err := writeAgentRuntimePool(r.Context(), qtx, updated.WorkspaceID, updated.ID, runtimePool); err != nil {
 			slog.Warn("update agent: replace runtime pool failed", append(logger.RequestAttrs(r), "error", err, "agent_id", id)...)
 			writeError(w, http.StatusInternalServerError, "failed to update runtime pool: "+err.Error())
 			return
 		}
 	case runtimePoolClear:
-		cleared, err := h.clearAgentRuntimePool(r.Context(), updated.ID)
+		cleared, err := clearAgentRuntimePoolWithQueries(r.Context(), qtx, updated.ID)
 		if err != nil {
 			slog.Warn("update agent: clear runtime pool failed", append(logger.RequestAttrs(r), "error", err, "agent_id", id)...)
 			writeError(w, http.StatusInternalServerError, "failed to clear runtime pool: "+err.Error())
@@ -2362,14 +2386,20 @@ func (h *Handler) UpdateAgent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Invocation targets (MUL-3963): replace wholesale when the owner touched
-	// permission. Done after the row update so a permission_mode flip and its
-	// targets land together.
+	// permission. Same transaction so a permission_mode flip and its targets —
+	// and the projection/pool above — all land together or not at all.
 	if replacePermissionTargets {
-		if err := h.replaceInvocationTargets(r.Context(), updated.ID, parseUUID(requestUserID(r)), resolvedPerm.targets); err != nil {
+		if err := replaceInvocationTargetsWithQueries(r.Context(), qtx, updated.ID, parseUUID(requestUserID(r)), resolvedPerm.targets); err != nil {
 			slog.Warn("update agent: persist invocation targets failed", append(logger.RequestAttrs(r), "error", err, "agent_id", id)...)
 			writeError(w, http.StatusInternalServerError, "failed to update invocation targets: "+err.Error())
 			return
 		}
+	}
+
+	if err := tx.Commit(r.Context()); err != nil {
+		slog.Warn("update agent: commit failed", append(logger.RequestAttrs(r), "error", err, "agent_id", id)...)
+		writeError(w, http.StatusInternalServerError, "failed to commit agent update: "+err.Error())
+		return
 	}
 
 	resp := h.agentToResponse(updated)

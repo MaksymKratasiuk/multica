@@ -3,9 +3,15 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // These tests pin the config-API surface for ordered multi-runtime bindings
@@ -415,4 +421,88 @@ func TestGetAgent_SynthesizesLegacySingleton(t *testing.T) {
 	}
 
 	assertBindings(t, getPoolAgent(t, agentID).RuntimeBindings, runtimeID)
+}
+
+// failStatementTxStarter begins real transactions that answer one chosen sqlc
+// statement (matched by its `-- name:` marker) with an injected error, so a test
+// can prove a multi-statement handler transaction rolls back fully when a late
+// write fails. Reads outside the transaction still hit the real pool.
+type failStatementTxStarter struct {
+	delegate *pgxpool.Pool
+	failOn   string
+}
+
+func (s *failStatementTxStarter) Begin(ctx context.Context) (pgx.Tx, error) {
+	tx, err := s.delegate.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &failStatementTx{Tx: tx, failOn: s.failOn}, nil
+}
+
+type failStatementTx struct {
+	pgx.Tx
+	failOn string
+}
+
+func (t *failStatementTx) QueryRow(ctx context.Context, query string, args ...interface{}) pgx.Row {
+	if strings.Contains(query, t.failOn) {
+		return errorRow{err: fmt.Errorf("injected failure on %s", t.failOn)}
+	}
+	return t.Tx.QueryRow(ctx, query, args...)
+}
+
+func (t *failStatementTx) Exec(ctx context.Context, query string, args ...interface{}) (pgconn.CommandTag, error) {
+	if strings.Contains(query, t.failOn) {
+		return pgconn.CommandTag{}, fmt.Errorf("injected failure on %s", t.failOn)
+	}
+	return t.Tx.Exec(ctx, query, args...)
+}
+
+// TestUpdateAgent_PoolWriteFailureRollsBackProjection proves F2's atomicity: when
+// the ordered-pool binding write fails mid-update, the whole transaction rolls
+// back — the name projection and the runtime_id (priority-0) projection both
+// keep their pre-update values, and the binding rows are untouched. Before F2
+// the projection committed in its own transaction ahead of the pool write, so
+// this failure left runtime_id pointing at a runtime no binding row backed
+// (invariant I3 violation) and a rename that "took" while the pool did not.
+func TestUpdateAgent_PoolWriteFailureRollsBackProjection(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	rtA := createPoolRuntime(t, ctx, "f2-rollback-a", "anthropic")
+	rtB := createPoolRuntime(t, ctx, "f2-rollback-b", "openai")
+
+	agent := createPoolAgent(t, "f2-rollback-agent", map[string]any{
+		"runtime_ids": []string{rtA, rtB},
+		"visibility":  "private",
+	})
+	assertBindings(t, agent.RuntimeBindings, rtA, rtB)
+	if agent.RuntimeID != rtA {
+		t.Fatalf("precondition: runtime_id = %q, want priority-0 %q", agent.RuntimeID, rtA)
+	}
+
+	// Swap in a tx that fails the pool binding insert, then attempt an update
+	// that changes BOTH the name projection and the pool order. The projection
+	// write and the (now-failing) binding write must live or die together.
+	failing := *testHandler
+	failing.TxStarter = &failStatementTxStarter{delegate: testPool, failOn: "-- name: CreateAgentRuntimeBinding"}
+
+	body := map[string]any{"name": "f2-rollback-agent-renamed", "runtime_ids": []string{rtB, rtA}}
+	w := httptest.NewRecorder()
+	failing.UpdateAgent(w, withURLParam(newRequest(http.MethodPatch, "/api/agents/"+agent.ID, body), "id", agent.ID))
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("UpdateAgent with injected pool-write failure: got %d, want 500: %s", w.Code, w.Body.String())
+	}
+
+	// Read back through the real handler: nothing changed.
+	after := getPoolAgent(t, agent.ID)
+	if after.Name != "f2-rollback-agent" {
+		t.Fatalf("name projection = %q, want unchanged %q (rolled back)", after.Name, "f2-rollback-agent")
+	}
+	if after.RuntimeID != rtA {
+		t.Fatalf("runtime_id projection = %q, want unchanged %q (rolled back)", after.RuntimeID, rtA)
+	}
+	assertBindings(t, after.RuntimeBindings, rtA, rtB)
 }

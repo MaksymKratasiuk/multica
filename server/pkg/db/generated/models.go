@@ -187,6 +187,7 @@ type AgentTaskQueue struct {
 	CancelledByID             pgtype.UUID `json:"cancelled_by_id"`
 	CancelledByName           pgtype.Text `json:"cancelled_by_name"`
 	IssueSnapshot             []byte      `json:"issue_snapshot"`
+	DispatchRuntimeAudit      []byte      `json:"dispatch_runtime_audit"`
 }
 
 type AgentToLabel struct {
@@ -1283,6 +1284,7 @@ type RuntimeProviderCircuit struct {
 	ProbeExpiresAt     pgtype.Timestamptz `json:"probe_expires_at"`
 	CreatedAt          pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt          pgtype.Timestamptz `json:"updated_at"`
+	ResetSource        pgtype.Text        `json:"reset_source"`
 }
 
 type SeatCapacityOutbox struct {

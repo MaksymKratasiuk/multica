@@ -2,9 +2,12 @@ package service
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/multica-ai/multica/server/internal/util"
@@ -13,20 +16,31 @@ import (
 
 // SE-37711 / SE-37664: wire the pure circuit decision core (runtime_circuit.go)
 // into the terminal task callbacks. A terminal provider quota/auth failure opens
-// the failing runtime's provider circuit; a terminal success closes it. Both are
-// best-effort, post-commit side effects: the terminal status has already been
-// persisted, so a circuit write must never turn a committed completion into an
-// error. Every failure here is logged and swallowed. Idempotency is owned by the
-// queries — a duplicate or late callback for an older task is a no-op (zero rows
-// returned), and a stale success cannot close a fresher open circuit.
+// the failing runtime's provider circuit; a terminal success closes it.
+//
+// The open (F7) is durable: it runs inside the FailAgentTask transaction via
+// openRuntimeProviderCircuitTx, so the circuit write commits atomically with the
+// terminal status. A write failure aborts the whole transaction (fail-closed) —
+// the task is never marked failed while its circuit hold is lost, which would
+// otherwise read as a closed circuit and let the autopilot dispatch straight
+// back into the exhausted provider. The close-on-success stays a best-effort,
+// post-commit side effect: a lost close only delays recovery until the next
+// successful run, and must never turn a committed success into an error.
+// Idempotency is owned by the queries — a duplicate or late callback for an
+// older task is a no-op (zero rows), and a stale success cannot close a fresher
+// open circuit.
 
-// syncRuntimeCircuitOnFailure opens the runtime's provider circuit when a
-// terminal failure is a provider quota or auth/access refusal (invariant I7).
-// It only reaches the DB for those two failure classes; every other reason
-// resolves to "no circuit" in the pure classifier and returns before any I/O.
-func (s *TaskService) syncRuntimeCircuitOnFailure(ctx context.Context, task db.AgentTaskQueue, failureReason, errMsg string) {
+// openRuntimeProviderCircuitTx opens the failing runtime's provider circuit for
+// a terminal quota/auth failure (invariant I7), using the caller's queries
+// handle. When that handle is a transaction (the FailAgentTask path), the write
+// commits atomically with the terminal status and any write failure propagates
+// so the transaction rolls back fail-closed. It only reaches the DB for the two
+// circuit-bearing failure classes; every other reason resolves to "no circuit"
+// in the pure classifier and returns before any I/O. A vanished runtime or a
+// duplicate/late generation is a no-op (opened=false, err=nil).
+func openRuntimeProviderCircuitTx(ctx context.Context, q *db.Queries, task db.AgentTaskQueue, failureReason, errMsg string) (bool, error) {
 	if !task.RuntimeID.Valid {
-		return
+		return false, nil
 	}
 	now := time.Now().UTC()
 	failedAt := now
@@ -35,17 +49,19 @@ func (s *TaskService) syncRuntimeCircuitOnFailure(ctx context.Context, task db.A
 	}
 	decision := classifyCircuitFailure(failureReason, errMsg, failedAt, now)
 	if !decision.Open {
-		return
+		return false, nil
 	}
-	runtime, err := s.Queries.GetAgentRuntime(ctx, task.RuntimeID)
+	runtime, err := q.GetAgentRuntime(ctx, task.RuntimeID)
 	if err != nil {
-		slog.Warn("runtime circuit: load runtime for open failed",
-			"task_id", util.UUIDToString(task.ID),
-			"runtime_id", util.UUIDToString(task.RuntimeID),
-			"error", err)
-		return
+		if errors.Is(err, pgx.ErrNoRows) {
+			// The runtime was torn down mid-flight; there is nothing left to hold,
+			// and blocking the terminal status on a runtime that no longer exists
+			// would strand the task in 'running'.
+			return false, nil
+		}
+		return false, fmt.Errorf("load runtime for circuit open: %w", err)
 	}
-	rows, err := s.Queries.OpenRuntimeProviderCircuit(ctx, db.OpenRuntimeProviderCircuitParams{
+	rows, err := q.OpenRuntimeProviderCircuit(ctx, db.OpenRuntimeProviderCircuitParams{
 		WorkspaceID:        runtime.WorkspaceID,
 		RuntimeID:          task.RuntimeID,
 		Provider:           runtime.Provider,
@@ -53,19 +69,15 @@ func (s *TaskService) syncRuntimeCircuitOnFailure(ctx context.Context, task db.A
 		ResetAt:            pgtype.Timestamptz{Time: decision.HoldUntil, Valid: true},
 		FailureCompletedAt: pgtype.Timestamptz{Time: failedAt, Valid: true},
 		FailureTaskID:      task.ID,
+		ResetSource:        pgtype.Text{String: decision.ResetSource, Valid: decision.ResetSource != ""},
 	})
 	if err != nil {
-		slog.Warn("runtime circuit: open failed",
-			"task_id", util.UUIDToString(task.ID),
-			"runtime_id", util.UUIDToString(task.RuntimeID),
-			"provider", runtime.Provider,
-			"error", err)
-		return
+		return false, fmt.Errorf("open runtime provider circuit: %w", err)
 	}
 	if len(rows) == 0 {
 		// An equal-or-newer failure already owns the current generation: this is
 		// a duplicate/late callback for an older task. Nothing changed.
-		return
+		return false, nil
 	}
 	slog.Info("runtime provider circuit opened",
 		"task_id", util.UUIDToString(task.ID),
@@ -75,6 +87,7 @@ func (s *TaskService) syncRuntimeCircuitOnFailure(ctx context.Context, task db.A
 		"reset_source", decision.ResetSource,
 		"reset_at", decision.HoldUntil,
 		"generation", rows[0].Generation)
+	return true, nil
 }
 
 // syncRuntimeCircuitOnSuccess closes the runtime's provider circuit after a

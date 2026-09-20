@@ -21,7 +21,7 @@ WHERE runtime_id = $1 AND provider = $2
   AND state IN ('open', 'half_open')
   AND reset_at IS NOT NULL AND reset_at <= now()
   AND (probe_task_id IS NULL OR probe_expires_at IS NULL OR probe_expires_at < now())
-RETURNING id, workspace_id, runtime_id, provider, state, generation, reason, opened_at, reset_at, failure_completed_at, failure_task_id, success_completed_at, success_task_id, probe_task_id, probe_expires_at, created_at, updated_at
+RETURNING id, workspace_id, runtime_id, provider, state, generation, reason, opened_at, reset_at, failure_completed_at, failure_task_id, success_completed_at, success_task_id, probe_task_id, probe_expires_at, created_at, updated_at, reset_source
 `
 
 type AcquireRuntimeProviderHalfOpenProbeParams struct {
@@ -68,6 +68,7 @@ func (q *Queries) AcquireRuntimeProviderHalfOpenProbe(ctx context.Context, arg A
 			&i.ProbeExpiresAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.ResetSource,
 		); err != nil {
 			return nil, err
 		}
@@ -94,7 +95,7 @@ WHERE runtime_id = $1 AND provider = $2
   AND (failure_completed_at IS NULL
        OR $3 > failure_completed_at
        OR ($3 = failure_completed_at AND $4 > failure_task_id))
-RETURNING id, workspace_id, runtime_id, provider, state, generation, reason, opened_at, reset_at, failure_completed_at, failure_task_id, success_completed_at, success_task_id, probe_task_id, probe_expires_at, created_at, updated_at
+RETURNING id, workspace_id, runtime_id, provider, state, generation, reason, opened_at, reset_at, failure_completed_at, failure_task_id, success_completed_at, success_task_id, probe_task_id, probe_expires_at, created_at, updated_at, reset_source
 `
 
 type CloseRuntimeProviderCircuitOnSuccessParams struct {
@@ -141,6 +142,7 @@ func (q *Queries) CloseRuntimeProviderCircuitOnSuccess(ctx context.Context, arg 
 			&i.ProbeExpiresAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.ResetSource,
 		); err != nil {
 			return nil, err
 		}
@@ -164,7 +166,7 @@ func (q *Queries) DeleteRuntimeProviderCircuitsByRuntime(ctx context.Context, ru
 
 const getRuntimeProviderCircuit = `-- name: GetRuntimeProviderCircuit :one
 
-SELECT id, workspace_id, runtime_id, provider, state, generation, reason, opened_at, reset_at, failure_completed_at, failure_task_id, success_completed_at, success_task_id, probe_task_id, probe_expires_at, created_at, updated_at FROM runtime_provider_circuit
+SELECT id, workspace_id, runtime_id, provider, state, generation, reason, opened_at, reset_at, failure_completed_at, failure_task_id, success_completed_at, success_task_id, probe_task_id, probe_expires_at, created_at, updated_at, reset_source FROM runtime_provider_circuit
 WHERE runtime_id = $1 AND provider = $2
 `
 
@@ -197,6 +199,7 @@ func (q *Queries) GetRuntimeProviderCircuit(ctx context.Context, arg GetRuntimeP
 		&i.ProbeExpiresAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.ResetSource,
 	)
 	return i, err
 }
@@ -204,8 +207,8 @@ func (q *Queries) GetRuntimeProviderCircuit(ctx context.Context, arg GetRuntimeP
 const openRuntimeProviderCircuit = `-- name: OpenRuntimeProviderCircuit :many
 INSERT INTO runtime_provider_circuit (
     workspace_id, runtime_id, provider, state, generation, reason,
-    opened_at, reset_at, failure_completed_at, failure_task_id
-) VALUES ($1, $2, $3, 'open', 1, $4, now(), $5, $6, $7)
+    opened_at, reset_at, failure_completed_at, failure_task_id, reset_source
+) VALUES ($1, $2, $3, 'open', 1, $4, now(), $5, $6, $7, $8)
 ON CONFLICT (runtime_id, provider) DO UPDATE SET
     state = 'open',
     generation = runtime_provider_circuit.generation + 1,
@@ -214,6 +217,7 @@ ON CONFLICT (runtime_id, provider) DO UPDATE SET
     reset_at = EXCLUDED.reset_at,
     failure_completed_at = EXCLUDED.failure_completed_at,
     failure_task_id = EXCLUDED.failure_task_id,
+    reset_source = EXCLUDED.reset_source,
     success_completed_at = NULL,
     success_task_id = NULL,
     probe_task_id = NULL,
@@ -223,7 +227,7 @@ WHERE runtime_provider_circuit.failure_completed_at IS NULL
    OR EXCLUDED.failure_completed_at > runtime_provider_circuit.failure_completed_at
    OR (EXCLUDED.failure_completed_at = runtime_provider_circuit.failure_completed_at
        AND EXCLUDED.failure_task_id > runtime_provider_circuit.failure_task_id)
-RETURNING id, workspace_id, runtime_id, provider, state, generation, reason, opened_at, reset_at, failure_completed_at, failure_task_id, success_completed_at, success_task_id, probe_task_id, probe_expires_at, created_at, updated_at
+RETURNING id, workspace_id, runtime_id, provider, state, generation, reason, opened_at, reset_at, failure_completed_at, failure_task_id, success_completed_at, success_task_id, probe_task_id, probe_expires_at, created_at, updated_at, reset_source
 `
 
 type OpenRuntimeProviderCircuitParams struct {
@@ -234,6 +238,7 @@ type OpenRuntimeProviderCircuitParams struct {
 	ResetAt            pgtype.Timestamptz `json:"reset_at"`
 	FailureCompletedAt pgtype.Timestamptz `json:"failure_completed_at"`
 	FailureTaskID      pgtype.UUID        `json:"failure_task_id"`
+	ResetSource        pgtype.Text        `json:"reset_source"`
 }
 
 // Terminal-failure write. Opens the circuit, or escalates an already-open one,
@@ -250,6 +255,7 @@ func (q *Queries) OpenRuntimeProviderCircuit(ctx context.Context, arg OpenRuntim
 		arg.ResetAt,
 		arg.FailureCompletedAt,
 		arg.FailureTaskID,
+		arg.ResetSource,
 	)
 	if err != nil {
 		return nil, err
@@ -276,6 +282,7 @@ func (q *Queries) OpenRuntimeProviderCircuit(ctx context.Context, arg OpenRuntim
 			&i.ProbeExpiresAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.ResetSource,
 		); err != nil {
 			return nil, err
 		}

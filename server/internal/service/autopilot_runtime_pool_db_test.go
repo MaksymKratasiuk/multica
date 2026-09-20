@@ -141,4 +141,59 @@ func TestSelectPoolRuntimeAgainstDB(t *testing.T) {
 			t.Fatalf("outcome=%v chosen=%s, want selected r0=%s (reset elapsed)", decision.Outcome, util.UUIDToString(decision.Chosen.RuntimeID), r0)
 		}
 	})
+
+	// insertCircuitReason opens a circuit carrying a failure class, so the DB
+	// path proves the selector reads runtime_provider_circuit.reason and applies
+	// the F3 auth-no-switch rule off it.
+	insertCircuitReason := func(runtimeID, state, reason string, resetAt time.Time) {
+		t.Helper()
+		var reset any
+		if !resetAt.IsZero() {
+			reset = resetAt
+		}
+		execBindingTeardown(t, pool, `
+			INSERT INTO runtime_provider_circuit (workspace_id, runtime_id, provider, state, reason, reset_at, opened_at)
+			VALUES ($1, $2, 'binding_teardown_test', $3, $4, $5, now())`,
+			workspaceID, runtimeID, state, reason, reset)
+		t.Cleanup(func() {
+			_, _ = pool.Exec(ctx, `DELETE FROM runtime_provider_circuit WHERE runtime_id = $1`, runtimeID)
+		})
+	}
+
+	t.Run("auth-held primary skips with no fallback to a healthy secondary", func(t *testing.T) {
+		r0 := insertRuntimeForBindingTeardown(t, pool, workspaceID, userID, "E r0")
+		r1 := insertRuntimeForBindingTeardown(t, pool, workspaceID, userID, "E r1")
+		agent := insertAgentForBindingTeardown(t, pool, workspaceID, userID, "agent E", r0)
+		insertBinding(t, pool, workspaceID, agent, r0, 0)
+		insertBinding(t, pool, workspaceID, agent, r1, 1)
+		insertCircuitReason(r0, "open", circuitClassAuth, future) // primary auth-held; r1 healthy
+
+		decision, _, err := svc.selectPoolRuntime(ctx, agentRow(agent))
+		if err != nil {
+			t.Fatalf("selectPoolRuntime: %v", err)
+		}
+		if decision.Outcome != fallbackAuthHeld {
+			t.Fatalf("outcome=%v, want auth held (no fallback to r1=%s)", decision.Outcome, r1)
+		}
+		if !decision.EarliestKnown || decision.EarliestReset.Sub(future).Abs() > time.Second {
+			t.Fatalf("earliest=%v known=%v, want ~%v", decision.EarliestReset, decision.EarliestKnown, future)
+		}
+	})
+
+	t.Run("quota-held primary still falls over to the healthy secondary", func(t *testing.T) {
+		r0 := insertRuntimeForBindingTeardown(t, pool, workspaceID, userID, "F r0")
+		r1 := insertRuntimeForBindingTeardown(t, pool, workspaceID, userID, "F r1")
+		agent := insertAgentForBindingTeardown(t, pool, workspaceID, userID, "agent F", r0)
+		insertBinding(t, pool, workspaceID, agent, r0, 0)
+		insertBinding(t, pool, workspaceID, agent, r1, 1)
+		insertCircuitReason(r0, "open", circuitClassQuota, future) // primary quota-held; r1 healthy
+
+		decision, _, err := svc.selectPoolRuntime(ctx, agentRow(agent))
+		if err != nil {
+			t.Fatalf("selectPoolRuntime: %v", err)
+		}
+		if decision.Outcome != fallbackSelected || util.UUIDToString(decision.Chosen.RuntimeID) != r1 {
+			t.Fatalf("outcome=%v chosen=%s, want selected r1=%s (quota falls through)", decision.Outcome, util.UUIDToString(decision.Chosen.RuntimeID), r1)
+		}
+	})
 }

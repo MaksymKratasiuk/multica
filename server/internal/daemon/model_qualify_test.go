@@ -174,7 +174,7 @@ func TestResolveTaskModelSelectionReadsTheCatalogAtMostOnce(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			reads := stubModelDiscovery(t, thinkingCatalogs())
 
-			got := resolveTaskModelSelection(context.Background(), tt.provider, agent.Command{}, tt.in, quietTaskLog())
+			got, _ := resolveTaskModelSelection(context.Background(), tt.provider, agent.Command{}, tt.in, quietTaskLog())
 			if got != tt.want {
 				t.Errorf("resolveTaskModelSelection(%s, %+v) = %+v, want %+v", tt.provider, tt.in, got, tt.want)
 			}
@@ -248,9 +248,138 @@ func TestResolveTaskModelSelectionDropsCrossProviderIncompatibleModel(t *testing
 		t.Run(tt.name, func(t *testing.T) {
 			reads := stubModelDiscovery(t, thinkingCatalogs())
 
-			got := resolveTaskModelSelection(context.Background(), tt.provider, agent.Command{}, tt.in, quietTaskLog())
+			got, _ := resolveTaskModelSelection(context.Background(), tt.provider, agent.Command{}, tt.in, quietTaskLog())
 			if got != tt.want {
 				t.Errorf("resolveTaskModelSelection(%s, %+v) = %+v, want %+v", tt.provider, tt.in, got, tt.want)
+			}
+			if reads() != tt.wantReads {
+				t.Errorf("catalog reads = %d, want %d", reads(), tt.wantReads)
+			}
+		})
+	}
+}
+
+// TestResolveTaskModelSelectionClearsPinUnresolvableAgainstLiveCatalog is the
+// SE-37741 F8 fail-safe: when a quota/auth circuit routes an execution onto a
+// fallback runtime whose provider differs from the one a pin was made for, the
+// pin — and the capability overrides keyed on it — must be cleared to the
+// runtime default rather than reaching the CLI and failing the launch. The
+// clearing is driven by the runtime's authoritative live catalog (reusing the
+// read qualification already took, never an extra one) and records a model_action
+// for the audit. The agent's saved configuration is never mutated: this operates
+// on the by-value selector only.
+func TestResolveTaskModelSelectionClearsPinUnresolvableAgainstLiveCatalog(t *testing.T) {
+	gatewayOpus := agent.Model{ID: "multica-anthropic/claude/claude-opus-5", Provider: "multica-anthropic"}
+	tests := []struct {
+		name       string
+		provider   string
+		catalogs   map[string]agent.Catalog
+		in         taskModelSelection
+		want       taskModelSelection
+		wantAction string
+		wantReads  int
+	}{
+		{
+			// The canonical failure: an OpenAI/Codex model pinned on an agent
+			// whose fallback runtime speaks Claude. Static classification catches
+			// it with no catalog read, and clears the thinking level with it.
+			name:       "gpt-5.6-sol on a claude fallback is cleared statically with its overrides",
+			provider:   "claude",
+			catalogs:   map[string]agent.Catalog{},
+			in:         taskModelSelection{Model: "gpt-5.6-sol", ThinkingLevel: "high"},
+			want:       taskModelSelection{},
+			wantAction: modelActionClearedIncompatible,
+			wantReads:  0,
+		},
+		{
+			// opencode cannot launch an unqualified selector, so it reads the
+			// catalog even with no override; a pin absent from that catalog is
+			// unknown to this runtime and is cleared.
+			name:       "unknown pin on opencode is cleared against the live catalog",
+			provider:   "opencode",
+			catalogs:   map[string]agent.Catalog{"opencode": {Models: []agent.Model{gatewayOpus}}},
+			in:         taskModelSelection{Model: "gpt-5.6-sol"},
+			want:       taskModelSelection{},
+			wantAction: modelActionClearedUnresolved,
+			wantReads:  1,
+		},
+		{
+			name:       "cleared unresolved pin drops thinking and service tier too",
+			provider:   "opencode",
+			catalogs:   map[string]agent.Catalog{"opencode": {Models: []agent.Model{gatewayOpus}}},
+			in:         taskModelSelection{Model: "gpt-5.6-sol", ThinkingLevel: "high", ServiceTier: "priority"},
+			want:       taskModelSelection{},
+			wantAction: modelActionClearedUnresolved,
+			wantReads:  1,
+		},
+		{
+			// A bare id two providers both expose cannot be placed; qualification
+			// declines to guess, so it stays unresolved and is cleared.
+			name:     "ambiguous bare id is cleared",
+			provider: "deveco",
+			catalogs: map[string]agent.Catalog{"deveco": {Models: []agent.Model{
+				{ID: "prov-a/shared-model", Provider: "prov-a"},
+				{ID: "prov-b/shared-model", Provider: "prov-b"},
+			}}},
+			in:         taskModelSelection{Model: "shared-model"},
+			want:       taskModelSelection{},
+			wantAction: modelActionClearedUnresolved,
+			wantReads:  1,
+		},
+		{
+			// An empty (but successful) catalog read means the runtime advertises
+			// nothing we can honour; fail safe to the runtime default.
+			name:       "empty live catalog clears the pin",
+			provider:   "opencode",
+			catalogs:   map[string]agent.Catalog{"opencode": {Models: []agent.Model{}}},
+			in:         taskModelSelection{Model: "some-model"},
+			want:       taskModelSelection{},
+			wantAction: modelActionClearedUnresolved,
+			wantReads:  1,
+		},
+		{
+			// A uniquely-qualified pin is exactly the fallback we want to keep:
+			// the catalog names one owner, so it is promoted and kept.
+			name:       "uniquely qualified pin is kept and reported qualified",
+			provider:   "opencode",
+			catalogs:   map[string]agent.Catalog{"opencode": {Models: []agent.Model{gatewayOpus}}},
+			in:         taskModelSelection{Model: "claude/claude-opus-5"},
+			want:       taskModelSelection{Model: "multica-anthropic/claude/claude-opus-5"},
+			wantAction: modelActionQualified,
+			wantReads:  1,
+		},
+		{
+			name:       "exact catalog id is kept",
+			provider:   "opencode",
+			catalogs:   map[string]agent.Catalog{"opencode": {Models: []agent.Model{gatewayOpus}}},
+			in:         taskModelSelection{Model: "multica-anthropic/claude/claude-opus-5"},
+			want:       taskModelSelection{Model: "multica-anthropic/claude/claude-opus-5"},
+			wantAction: modelActionKept,
+			wantReads:  1,
+		},
+		{
+			// A static fallback catalog is a stand-in, not the runtime's real
+			// list — it must never be the basis for erasing a pin.
+			name:       "fallback catalog does not clear the pin",
+			provider:   "opencode",
+			catalogs:   map[string]agent.Catalog{"opencode": {Fallback: true, Models: []agent.Model{gatewayOpus}}},
+			in:         taskModelSelection{Model: "some-unlisted-model"},
+			want:       taskModelSelection{Model: "some-unlisted-model"},
+			wantAction: modelActionKept,
+			wantReads:  1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reads := stubModelDiscovery(t, tt.catalogs)
+
+			got, action := resolveTaskModelSelection(context.Background(), tt.provider, agent.Command{}, tt.in, quietTaskLog())
+			if got != tt.want {
+				t.Errorf("selection = %+v, want %+v", got, tt.want)
+			}
+			if action != tt.wantAction {
+				t.Errorf("model_action = %q, want %q", action, tt.wantAction)
 			}
 			if reads() != tt.wantReads {
 				t.Errorf("catalog reads = %d, want %d", reads(), tt.wantReads)
@@ -277,9 +406,12 @@ func TestResolveTaskModelSelectionFailsOpenOnDiscoveryError(t *testing.T) {
 	t.Cleanup(func() { listModels = orig })
 
 	in := taskModelSelection{Model: "claude/claude-opus-5", ThinkingLevel: "high"}
-	got := resolveTaskModelSelection(context.Background(), "opencode", agent.Command{}, in, quietTaskLog())
+	got, action := resolveTaskModelSelection(context.Background(), "opencode", agent.Command{}, in, quietTaskLog())
 	if got != in {
 		t.Errorf("resolveTaskModelSelection on discovery error = %+v, want %+v unchanged", got, in)
+	}
+	if action != modelActionKept {
+		t.Errorf("model_action on discovery error = %q, want %q — a failed read must not clear the pin", action, modelActionKept)
 	}
 
 	mu.Lock()

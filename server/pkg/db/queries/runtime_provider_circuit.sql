@@ -14,8 +14,8 @@ WHERE runtime_id = $1 AND provider = $2;
 -- generation. Each accepted failure bumps generation and clears any probe.
 INSERT INTO runtime_provider_circuit (
     workspace_id, runtime_id, provider, state, generation, reason,
-    opened_at, reset_at, failure_completed_at, failure_task_id
-) VALUES ($1, $2, $3, 'open', 1, $4, now(), $5, $6, $7)
+    opened_at, reset_at, failure_completed_at, failure_task_id, reset_source
+) VALUES ($1, $2, $3, 'open', 1, $4, now(), $5, $6, $7, $8)
 ON CONFLICT (runtime_id, provider) DO UPDATE SET
     state = 'open',
     generation = runtime_provider_circuit.generation + 1,
@@ -24,6 +24,7 @@ ON CONFLICT (runtime_id, provider) DO UPDATE SET
     reset_at = EXCLUDED.reset_at,
     failure_completed_at = EXCLUDED.failure_completed_at,
     failure_task_id = EXCLUDED.failure_task_id,
+    reset_source = EXCLUDED.reset_source,
     success_completed_at = NULL,
     success_task_id = NULL,
     probe_task_id = NULL,

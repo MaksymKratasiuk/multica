@@ -116,37 +116,17 @@ func writeAgentRuntimePool(ctx context.Context, qtx *db.Queries, wsUUID, agentID
 	return nil
 }
 
-// replaceAgentRuntimePool atomically swaps an agent's ordered pool in its own
-// transaction. UpdateAgent runs non-transactionally and has already set the
-// agent.runtime_id projection to the same priority-0 runtime, so only the
-// binding rows are (re)written here.
-func (h *Handler) replaceAgentRuntimePool(ctx context.Context, wsUUID, agentID pgtype.UUID, runtimes []db.AgentRuntime) error {
-	tx, err := h.TxStarter.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback(ctx)
-	qtx := h.Queries.WithTx(tx)
-	if err := writeAgentRuntimePool(ctx, qtx, wsUUID, agentID, runtimes); err != nil {
-		return err
-	}
-	return tx.Commit(ctx)
-}
-
-// clearAgentRuntimePool empties an agent's runtime pool and nulls the legacy
-// runtime_id projection in one transaction, leaving the agent unbound: it keeps
-// its configuration and history and needs a new runtime before it can run again
-// (MUL-5559, invariant I14). An unbound agent cannot run, so its autopilots are
-// paused in the same transaction — the same consequence runtime teardown applies
-// when a pool empties, so a user-initiated clear and an automatic one converge.
-// Returns the refreshed agent row.
-func (h *Handler) clearAgentRuntimePool(ctx context.Context, agentID pgtype.UUID) (db.Agent, error) {
-	tx, err := h.TxStarter.Begin(ctx)
-	if err != nil {
-		return db.Agent{}, err
-	}
-	defer tx.Rollback(ctx)
-	qtx := h.Queries.WithTx(tx)
+// clearAgentRuntimePoolWithQueries empties an agent's runtime pool and nulls the
+// legacy runtime_id projection inside the caller's transaction, leaving the
+// agent unbound: it keeps its configuration and history and needs a new runtime
+// before it can run again (MUL-5559, invariant I14). An unbound agent cannot
+// run, so its autopilots are paused in the same transaction — the same
+// consequence runtime teardown applies when a pool empties, so a user-initiated
+// clear and an automatic one converge. The FOR UPDATE lock serializes the swap
+// against runtime teardown and a concurrent edit. Returns the refreshed agent
+// row. The caller commits, so the pool clear, the projection null, and any
+// sibling writes (e.g. UpdateAgent) are never observed half-applied (F2).
+func clearAgentRuntimePoolWithQueries(ctx context.Context, qtx *db.Queries, agentID pgtype.UUID) (db.Agent, error) {
 	if _, err := qtx.ListAgentRuntimeBindingsForAgentForUpdate(ctx, agentID); err != nil {
 		return db.Agent{}, err
 	}
@@ -158,9 +138,6 @@ func (h *Handler) clearAgentRuntimePool(ctx context.Context, agentID pgtype.UUID
 		return db.Agent{}, err
 	}
 	if _, err := qtx.PauseAutopilotsByUnboundAgents(ctx, []pgtype.UUID{agentID}); err != nil {
-		return db.Agent{}, err
-	}
-	if err := tx.Commit(ctx); err != nil {
 		return db.Agent{}, err
 	}
 	return cleared, nil

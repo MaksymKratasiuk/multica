@@ -13,8 +13,8 @@ import (
 )
 
 // TestRuntimeProviderCircuitLifecycle pins the DB-level invariants the terminal
-// task callbacks (syncRuntimeCircuitOnFailure / …OnSuccess) rely on, against a
-// real database:
+// task callbacks (openRuntimeProviderCircuitTx / syncRuntimeCircuitOnSuccess)
+// rely on, against a real database:
 //
 //   - a fresh quota failure opens the circuit at generation 1;
 //   - a newer failure escalates it and bumps the generation;

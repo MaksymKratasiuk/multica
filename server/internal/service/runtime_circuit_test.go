@@ -206,4 +206,54 @@ func TestSelectFallbackRuntime(t *testing.T) {
 			t.Fatalf("outcome = %v, want none available", got.Outcome)
 		}
 	})
+
+	// F3: an auth/access hold on the PRIMARY never auto-switches to a fallback,
+	// a quota hold does, and an auth hold on a non-primary binding is just a
+	// skipped candidate (only the primary's credential must never be masked).
+	t.Run("auth hold on primary skips with no fallback", func(t *testing.T) {
+		got := selectFallbackRuntime([]runtimeCandidate{
+			{RuntimeID: uuidFrom(1), Priority: 0, Available: true, Held: true, HeldClass: circuitClassAuth, HoldUntil: now.Add(4 * time.Hour)},
+			{RuntimeID: uuidFrom(2), Priority: 1, Available: true, Held: false}, // healthy, but must NOT be chosen
+		})
+		if got.Outcome != fallbackAuthHeld {
+			t.Fatalf("outcome = %v, want auth held (no fallback)", got.Outcome)
+		}
+		if !got.EarliestKnown || !got.EarliestReset.Equal(now.Add(4*time.Hour)) {
+			t.Fatalf("earliest = %v known=%v, want %s", got.EarliestReset, got.EarliestKnown, now.Add(4*time.Hour))
+		}
+	})
+
+	t.Run("quota hold on primary falls through to a ready binding", func(t *testing.T) {
+		got := selectFallbackRuntime([]runtimeCandidate{
+			{RuntimeID: uuidFrom(1), Priority: 0, Available: true, Held: true, HeldClass: circuitClassQuota, HoldUntil: now.Add(time.Hour)},
+			{RuntimeID: uuidFrom(2), Priority: 1, Available: true, Held: false},
+		})
+		if got.Outcome != fallbackSelected || got.Chosen.RuntimeID != uuidFrom(2) {
+			t.Fatalf("unexpected: %+v, want selected priority-1", got)
+		}
+	})
+
+	t.Run("auth hold on a non-primary binding does not block a lower ready one", func(t *testing.T) {
+		got := selectFallbackRuntime([]runtimeCandidate{
+			{RuntimeID: uuidFrom(1), Priority: 0, Available: true, Held: true, HeldClass: circuitClassQuota, HoldUntil: now.Add(time.Hour)},
+			{RuntimeID: uuidFrom(2), Priority: 1, Available: true, Held: true, HeldClass: circuitClassAuth, HoldUntil: now.Add(4 * time.Hour)},
+			{RuntimeID: uuidFrom(3), Priority: 2, Available: true, Held: false},
+		})
+		if got.Outcome != fallbackSelected || got.Chosen.RuntimeID != uuidFrom(3) {
+			t.Fatalf("unexpected: %+v, want selected priority-2", got)
+		}
+	})
+
+	t.Run("auth hold on primary with unknown deadline does not fabricate one", func(t *testing.T) {
+		got := selectFallbackRuntime([]runtimeCandidate{
+			{RuntimeID: uuidFrom(1), Priority: 0, Available: true, Held: true, HeldClass: circuitClassAuth}, // zero HoldUntil
+			{RuntimeID: uuidFrom(2), Priority: 1, Available: true, Held: false},
+		})
+		if got.Outcome != fallbackAuthHeld {
+			t.Fatalf("outcome = %v, want auth held", got.Outcome)
+		}
+		if got.EarliestKnown {
+			t.Fatalf("earliest should be unknown, got %s", got.EarliestReset)
+		}
+	})
 }

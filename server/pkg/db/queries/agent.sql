@@ -1041,6 +1041,26 @@ SET status = 'running',
 WHERE id = $1 AND status IN ('dispatched', 'waiting_local_directory')
 RETURNING *;
 
+-- name: SetTaskDispatchModelAction :exec
+-- Enriches an existing runtime-failover audit (F6) with the per-execution model
+-- fail-safe outcome (F8 model_action). The daemon resolves the model action at
+-- pickup, after the autopilot dispatch that recorded the failover audit, so both
+-- events land on the same jsonb object keyed to the task. The WHERE guard scopes
+-- the write to tasks that actually failed over: an ordinary dispatch has no
+-- audit, and model_action there is already visible in the task log, so we do not
+-- stamp a stray audit onto every routed task. Idempotent — one audit per task,
+-- model_action overwritten in place; a no-op (zero rows) when no failover audit
+-- exists.
+UPDATE agent_task_queue
+SET dispatch_runtime_audit = jsonb_set(
+        dispatch_runtime_audit,
+        '{model_action}',
+        to_jsonb(sqlc.arg(model_action)::text),
+        true
+    )
+WHERE id = $1
+  AND dispatch_runtime_audit IS NOT NULL;
+
 -- name: MarkAgentTaskWaitingLocalDirectory :one
 -- Transitions a freshly-dispatched task into 'waiting_local_directory' while
 -- the daemon waits for another in-flight task to release the path lock on a
