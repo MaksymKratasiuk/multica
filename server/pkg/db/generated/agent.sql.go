@@ -1542,8 +1542,26 @@ WHERE id = (
           FROM agent a
           JOIN agent_runtime r ON r.id = atq.runtime_id
           WHERE a.id = atq.agent_id
-            -- A task's persisted runtime is not authority after an agent rebind.
-            AND a.runtime_id = atq.runtime_id
+            -- A task's persisted runtime is not authority after an agent
+            -- rebind: it must still be one of the agent's current bindings
+            -- (agent_runtime_binding). With no binding rows, agent.runtime_id
+            -- is the singleton pool, so fall back to it. This is what lets a
+            -- quota fallback pin a non-priority-0 binding and still be claimed
+            -- (agent_runtime_binding.sql).
+            AND (
+                EXISTS (
+                    SELECT 1 FROM agent_runtime_binding arb
+                    WHERE arb.agent_id = a.id
+                      AND arb.runtime_id = atq.runtime_id
+                )
+                OR (
+                    a.runtime_id = atq.runtime_id
+                    AND NOT EXISTS (
+                        SELECT 1 FROM agent_runtime_binding arbx
+                        WHERE arbx.agent_id = a.id
+                    )
+                )
+            )
             -- Queued private-runtime rows are claimable so the handler can
             -- settle an owner mismatch through the existing FailTask path
             -- before daemon delivery. Public runtimes remain shareable across
@@ -5998,7 +6016,22 @@ WHERE atq.runtime_id = $1
       FROM agent a
       JOIN agent_runtime r ON r.id = atq.runtime_id
       WHERE a.id = atq.agent_id
-        AND a.runtime_id = atq.runtime_id
+        -- Keep the current-binding check in sync with ClaimAgentTask so a
+        -- fallback-pinned task shows up as a claim candidate for its runtime.
+        AND (
+            EXISTS (
+                SELECT 1 FROM agent_runtime_binding arb
+                WHERE arb.agent_id = a.id
+                  AND arb.runtime_id = atq.runtime_id
+            )
+            OR (
+                a.runtime_id = atq.runtime_id
+                AND NOT EXISTS (
+                    SELECT 1 FROM agent_runtime_binding arbx
+                    WHERE arbx.agent_id = a.id
+                )
+            )
+        )
         AND (
             r.visibility = 'public'
             OR r.visibility = 'private'
@@ -6105,7 +6138,22 @@ WHERE atq.runtime_id = ANY($1::uuid[])
       FROM agent a
       JOIN agent_runtime r ON r.id = atq.runtime_id
       WHERE a.id = atq.agent_id
-        AND a.runtime_id = atq.runtime_id
+        -- Keep the current-binding check in sync with ClaimAgentTask so a
+        -- fallback-pinned task shows up as a claim candidate for its runtime.
+        AND (
+            EXISTS (
+                SELECT 1 FROM agent_runtime_binding arb
+                WHERE arb.agent_id = a.id
+                  AND arb.runtime_id = atq.runtime_id
+            )
+            OR (
+                a.runtime_id = atq.runtime_id
+                AND NOT EXISTS (
+                    SELECT 1 FROM agent_runtime_binding arbx
+                    WHERE arbx.agent_id = a.id
+                )
+            )
+        )
         AND (
             r.visibility = 'public'
             OR r.visibility = 'private'
@@ -7635,7 +7683,23 @@ WHERE id = (
           FROM agent a
           JOIN agent_runtime r ON r.id = atq.runtime_id
           WHERE a.id = atq.agent_id
-            AND a.runtime_id = atq.runtime_id
+            -- Task runtime must still be a current binding of the agent (or the
+            -- singleton agent.runtime_id when the pool is empty); keep in sync
+            -- with ClaimAgentTask so a fallback-pinned task is reclaimable too.
+            AND (
+                EXISTS (
+                    SELECT 1 FROM agent_runtime_binding arb
+                    WHERE arb.agent_id = a.id
+                      AND arb.runtime_id = atq.runtime_id
+                )
+                OR (
+                    a.runtime_id = atq.runtime_id
+                    AND NOT EXISTS (
+                        SELECT 1 FROM agent_runtime_binding arbx
+                        WHERE arbx.agent_id = a.id
+                    )
+                )
+            )
             AND (
                 r.visibility = 'public'
                 OR (
@@ -7760,7 +7824,23 @@ WHERE id IN (
           FROM agent a
           JOIN agent_runtime r ON r.id = atq.runtime_id
           WHERE a.id = atq.agent_id
-            AND a.runtime_id = atq.runtime_id
+            -- Task runtime must still be a current binding of the agent (or the
+            -- singleton agent.runtime_id when the pool is empty); keep in sync
+            -- with ClaimAgentTask so a fallback-pinned task is reclaimable too.
+            AND (
+                EXISTS (
+                    SELECT 1 FROM agent_runtime_binding arb
+                    WHERE arb.agent_id = a.id
+                      AND arb.runtime_id = atq.runtime_id
+                )
+                OR (
+                    a.runtime_id = atq.runtime_id
+                    AND NOT EXISTS (
+                        SELECT 1 FROM agent_runtime_binding arbx
+                        WHERE arbx.agent_id = a.id
+                    )
+                )
+            )
             AND (
                 r.visibility = 'public'
                 OR (
