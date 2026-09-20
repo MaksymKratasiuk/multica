@@ -185,6 +185,80 @@ func TestResolveTaskModelSelectionReadsTheCatalogAtMostOnce(t *testing.T) {
 	}
 }
 
+// TestResolveTaskModelSelectionDropsCrossProviderIncompatibleModel guards the
+// runtime-level quota fallback (SE-37711 / SE-37664, invariants I10/I15): when a
+// quota circuit routes an execution onto a runtime whose provider differs from
+// the one the persisted model pin was made for, a known-incompatible pin must be
+// dropped for this execution so the runtime launches with its own default model
+// — the gpt-5.6-sol → Claude pin must never reach the CLI. The static-catalog
+// classification does this without any discovery subprocess, so a dropped pin
+// costs zero catalog reads; unknown/custom ids the server cannot confidently
+// classify pass through untouched.
+func TestResolveTaskModelSelectionDropsCrossProviderIncompatibleModel(t *testing.T) {
+	tests := []struct {
+		name      string
+		provider  string
+		in        taskModelSelection
+		want      taskModelSelection
+		wantReads int
+	}{
+		{
+			// The canonical failure the fallback must prevent: an OpenAI/Codex
+			// model pinned on an agent whose fallback runtime speaks Claude.
+			name:      "codex model on a claude runtime is dropped",
+			provider:  "claude",
+			in:        taskModelSelection{Model: "gpt-5.6-sol"},
+			want:      taskModelSelection{Model: ""},
+			wantReads: 0,
+		},
+		{
+			name:      "claude model on a codex runtime is dropped",
+			provider:  "codex",
+			in:        taskModelSelection{Model: "claude-opus-5"},
+			want:      taskModelSelection{Model: ""},
+			wantReads: 0,
+		},
+		{
+			// A context-window variant is the same Claude model; it stays.
+			name:      "claude context-window variant on a claude runtime is kept",
+			provider:  "claude",
+			in:        taskModelSelection{Model: "claude-opus-5[1m]"},
+			want:      taskModelSelection{Model: "claude-opus-5[1m]"},
+			wantReads: 0,
+		},
+		{
+			name:      "native model on its own provider is kept",
+			provider:  "claude",
+			in:        taskModelSelection{Model: "claude-opus-5"},
+			want:      taskModelSelection{Model: "claude-opus-5"},
+			wantReads: 0,
+		},
+		{
+			// A manual/custom id the server cannot classify against a static
+			// catalog is left alone rather than erased.
+			name:      "unknown custom pin passes through untouched",
+			provider:  "claude",
+			in:        taskModelSelection{Model: "my-org-tuned-model"},
+			want:      taskModelSelection{Model: "my-org-tuned-model"},
+			wantReads: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reads := stubModelDiscovery(t, thinkingCatalogs())
+
+			got := resolveTaskModelSelection(context.Background(), tt.provider, agent.Command{}, tt.in, quietTaskLog())
+			if got != tt.want {
+				t.Errorf("resolveTaskModelSelection(%s, %+v) = %+v, want %+v", tt.provider, tt.in, got, tt.want)
+			}
+			if reads() != tt.wantReads {
+				t.Errorf("catalog reads = %d, want %d", reads(), tt.wantReads)
+			}
+		})
+	}
+}
+
 // A runtime that cannot answer must not block the task: the persisted model
 // may well be exactly what its CLI expects, and a stale-looking capability
 // override is kept rather than silently dropped on a transient failure. The

@@ -7512,6 +7512,25 @@ func resolveTaskModelSelection(
 	sel taskModelSelection,
 	taskLog *slog.Logger,
 ) taskModelSelection {
+	// A runtime-scoped quota circuit can route this execution onto a fallback
+	// runtime whose provider differs from the one the persisted model pin was
+	// made for (SE-37711 / SE-37664). A model that is a known mismatch for the
+	// selected provider would make the CLI refuse to launch, turning a
+	// recoverable quota event into a hard failure. Drop such a pin for THIS
+	// execution only, so the runtime launches with its own default model; the
+	// agent's persisted configuration is left untouched. Unknown or custom ids
+	// that cannot be confidently classified pass through
+	// (ModelKnownIncompatibleWithProvider returns false for them), and the
+	// static-catalog check reads no CLI subprocess, preserving the at-most-one
+	// discovery read below.
+	if sel.Model != "" && agent.ModelKnownIncompatibleWithProvider(provider, sel.Model) {
+		taskLog.Info("model: persisted pin is incompatible with the selected runtime provider; using the runtime default for this execution",
+			"provider", provider,
+			"configured_model", sel.Model,
+		)
+		sel.Model = ""
+	}
+
 	capabilityChecksPending := sel.ThinkingLevel != "" || sel.ServiceTier != ""
 
 	read := false
