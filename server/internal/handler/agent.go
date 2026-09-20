@@ -66,8 +66,14 @@ type AgentResponse struct {
 	// timestamp, device, owner, configuration, or credential fields; clients
 	// use it only when the full runtime row is unavailable.
 	RuntimeAvailability string `json:"runtime_availability,omitempty"`
-	Name                string `json:"name"`
-	Description         string `json:"description"`
+	// RuntimeBindings is the agent's ordered runtime pool (SE-37711), priority 0
+	// first. It is populated on the single-agent detail / create / update
+	// responses; list and broadcast payloads leave it empty, mirroring
+	// InvocationTargets. RuntimeID/RuntimeBound remain the flat projection for
+	// installed clients that do not read the pool.
+	RuntimeBindings []AgentRuntimeBindingDTO `json:"runtime_bindings"`
+	Name            string                   `json:"name"`
+	Description     string                   `json:"description"`
 	// Instructions is what this agent's owner wrote. For a system agent it
 	// holds only the workspace's own notes — the product half lives in
 	// SystemInstructions and is never stored on the row.
@@ -210,6 +216,7 @@ func (h *Handler) agentToResponse(a db.Agent) AgentResponse {
 		WorkspaceID:              uuidToString(a.WorkspaceID),
 		RuntimeID:                uuidToString(a.RuntimeID),
 		RuntimeBound:             a.RuntimeID.Valid,
+		RuntimeBindings:          []AgentRuntimeBindingDTO{},
 		Name:                     a.Name,
 		Description:              a.Description,
 		Instructions:             a.Instructions,
@@ -1255,6 +1262,10 @@ func (h *Handler) GetAgent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to load agent skills")
 		return
 	}
+	if err := h.enrichAgentResponseWithRuntimeBindings(r.Context(), &resp, agent.ID); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load agent runtime bindings")
+		return
+	}
 
 	// mcp_config redaction (custom_env was removed from this response shape
 	// in MUL-2600; secrets are now fetched via GET /api/agents/{id}/env).
@@ -1291,11 +1302,16 @@ type CreateAgentRequest struct {
 	ConversationStarters []AgentConversationStarter `json:"conversation_starters"`
 	AvatarURL            *string                    `json:"avatar_url"`
 	RuntimeID            string                     `json:"runtime_id"`
-	RuntimeConfig        any                        `json:"runtime_config"`
-	CustomEnv            map[string]string          `json:"custom_env"`
-	CustomArgs           []string                   `json:"custom_args"`
-	McpConfig            json.RawMessage            `json:"mcp_config"`
-	Visibility           string                     `json:"visibility"`
+	// RuntimeIDs is the ordered runtime pool (SE-37711), highest priority first.
+	// Mutually exclusive with the legacy single runtime_id; exactly one of the
+	// two must be supplied. A one-runtime pool is accepted; a larger pool must
+	// span at least two provider families.
+	RuntimeIDs    []string          `json:"runtime_ids"`
+	RuntimeConfig any               `json:"runtime_config"`
+	CustomEnv     map[string]string `json:"custom_env"`
+	CustomArgs    []string          `json:"custom_args"`
+	McpConfig     json.RawMessage   `json:"mcp_config"`
+	Visibility    string            `json:"visibility"`
 	// PermissionMode + InvocationTargets are the new invocation-permission
 	// inputs (MUL-3963). When permission_mode is present it is authoritative
 	// and Visibility is ignored; when absent, legacy Visibility is mapped
@@ -1393,8 +1409,15 @@ func (h *Handler) CreateAgent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("description must be %d characters or fewer", maxAgentDescriptionLength))
 		return
 	}
-	if req.RuntimeID == "" {
-		writeError(w, http.StatusBadRequest, "runtime_id is required")
+	// Runtime pool intent (SE-37711). The legacy single runtime_id and the
+	// ordered runtime_ids array are mutually exclusive; exactly one must be sent.
+	_, hasRuntimeIDs := rawFields["runtime_ids"]
+	if hasRuntimeIDs && req.RuntimeID != "" {
+		writeError(w, http.StatusBadRequest, "provide either runtime_id or runtime_ids, not both")
+		return
+	}
+	if !hasRuntimeIDs && req.RuntimeID == "" {
+		writeError(w, http.StatusBadRequest, "runtime_id or runtime_ids is required")
 		return
 	}
 	conversationStarters, err := normaliseAgentConversationStarters(req.ConversationStarters)
@@ -1410,10 +1433,6 @@ func (h *Handler) CreateAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	runtimeUUID, ok := parseUUIDOrBadRequest(w, req.RuntimeID, "runtime_id")
-	if !ok {
-		return
-	}
 	wsUUID, ok := parseUUIDOrBadRequest(w, workspaceID, "workspace id")
 	if !ok {
 		return
@@ -1430,23 +1449,25 @@ func (h *Handler) CreateAgent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, permErr.Error())
 		return
 	}
-	runtime, err := h.Queries.GetAgentRuntimeForWorkspace(r.Context(), db.GetAgentRuntimeForWorkspaceParams{
-		ID:          runtimeUUID,
-		WorkspaceID: wsUUID,
-	})
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid runtime_id")
-		return
-	}
 
 	member, ok := h.workspaceMember(w, r, workspaceID)
 	if !ok {
 		return
 	}
-	if !canUseRuntimeForAgent(member, runtime) {
-		writeError(w, http.StatusForbidden, "this runtime is private; only its owner can create agents on it")
+	// Ordered runtime pool (SE-37711). runtimePool[0] is the priority-0 runtime
+	// that becomes the agent.runtime_id projection and drives thinking/tier
+	// validation below; the full ordered list is persisted as binding rows in
+	// the same transaction as the agent row. A legacy runtime_id is resolved as
+	// a one-runtime pool so both wire shapes share one validation path.
+	runtimePoolIDs := req.RuntimeIDs
+	if !hasRuntimeIDs {
+		runtimePoolIDs = []string{req.RuntimeID}
+	}
+	runtimePool, ok := h.resolveAgentRuntimePool(w, r, wsUUID, member, runtimePoolIDs)
+	if !ok {
 		return
 	}
+	runtime := runtimePool[0]
 
 	// thinking_level validation: fixed-enum providers reject unknown literals;
 	// dynamic-catalog providers (Codex/OpenCode) reject malformed tokens here.
@@ -1605,6 +1626,14 @@ func (h *Handler) CreateAgent(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// Persist the ordered runtime pool in the same transaction so the agent is
+	// never visible with a runtime_id projection that its binding rows do not
+	// back (SE-37711, invariant I3).
+	if err := writeAgentRuntimePool(r.Context(), qtx, wsUUID, created.ID, runtimePool); err != nil {
+		slog.Warn("create agent: persist runtime pool failed", append(logger.RequestAttrs(r), "error", err, "agent_id", uuidToString(created.ID))...)
+		writeError(w, http.StatusInternalServerError, "failed to save agent runtime pool")
+		return
+	}
 	if err := tx.Commit(r.Context()); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to commit agent create")
 		return
@@ -1622,6 +1651,9 @@ func (h *Handler) CreateAgent(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := h.enrichAgentResponseWithTargets(r.Context(), &resp, created.ID); err != nil {
 		slog.Warn("create agent: load invocation targets for response failed", append(logger.RequestAttrs(r), "error", err, "agent_id", uuidToString(created.ID))...)
+	}
+	if err := h.enrichAgentResponseWithRuntimeBindings(r.Context(), &resp, created.ID); err != nil {
+		slog.Warn("create agent: load runtime bindings for response failed", append(logger.RequestAttrs(r), "error", err, "agent_id", uuidToString(created.ID))...)
 	}
 	actorType, actorID := h.resolveActor(r, ownerID, workspaceID)
 	h.publish(protocol.EventAgentCreated, workspaceID, actorType, actorID, map[string]any{"agent": broadcastAgentResponse(resp)})
@@ -1649,8 +1681,19 @@ type UpdateAgentRequest struct {
 	Instructions         *string                     `json:"instructions"`
 	ConversationStarters *[]AgentConversationStarter `json:"conversation_starters"`
 	AvatarURL            *string                     `json:"avatar_url"`
-	RuntimeID            *string                     `json:"runtime_id"`
-	RuntimeConfig        any                         `json:"runtime_config"`
+	// RuntimeID is a tri-state pointer (SE-37711 / MUL-5559):
+	//   - omitted → pool untouched
+	//   - "" → clear the pool (agent becomes unbound)
+	//   - value → replace the pool with that single runtime
+	// Mutually exclusive with runtime_ids.
+	RuntimeID *string `json:"runtime_id"`
+	// RuntimeIDs replaces the ordered runtime pool (SE-37711). An empty array
+	// clears the pool; a non-empty one sets it (a pool larger than one runtime
+	// must span at least two provider families). Mutually exclusive with
+	// runtime_id; presence is detected via the raw-fields map so an omitted key
+	// (preserve) is distinguishable from an explicit [] (clear).
+	RuntimeIDs    []string `json:"runtime_ids"`
+	RuntimeConfig any      `json:"runtime_config"`
 	// custom_env is intentionally NOT updatable through this endpoint.
 	// Use `PUT /api/agents/{id}/env` for env changes — that path admits
 	// the agent owner or a workspace owner/admin, denies agent actors,
@@ -1899,6 +1942,29 @@ func (h *Handler) UpdateAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Runtime pool intent (SE-37711). The legacy runtime_id pointer and the
+	// ordered runtime_ids array are mutually exclusive and collapse into one of
+	// untouched / set / clear so the runtime the agent lands on is resolved once.
+	_, hasRuntimeIDs := rawFields["runtime_ids"]
+	if hasRuntimeIDs && req.RuntimeID != nil {
+		writeError(w, http.StatusBadRequest, "provide either runtime_id or runtime_ids, not both")
+		return
+	}
+	poolIntent := runtimePoolUntouched
+	var poolIDs []string
+	switch {
+	case hasRuntimeIDs && len(req.RuntimeIDs) == 0:
+		poolIntent = runtimePoolClear
+	case hasRuntimeIDs:
+		poolIntent = runtimePoolSet
+		poolIDs = req.RuntimeIDs
+	case req.RuntimeID != nil && *req.RuntimeID == "":
+		poolIntent = runtimePoolClear
+	case req.RuntimeID != nil:
+		poolIntent = runtimePoolSet
+		poolIDs = []string{*req.RuntimeID}
+	}
+
 	params := db.UpdateAgentParams{
 		ID: existing.ID,
 	}
@@ -1956,30 +2022,23 @@ func (h *Handler) UpdateAgent(w http.ResponseWriter, r *http.Request) {
 	// runtime to validate a thinking_level change. Resolve once and reuse.
 	targetRuntimeID := existing.RuntimeID
 	targetProvider := ""
-	if req.RuntimeID != nil {
-		runtimeUUID, ok := parseUUIDOrBadRequest(w, *req.RuntimeID, "runtime_id")
-		if !ok {
-			return
-		}
-		runtime, err := h.Queries.GetAgentRuntimeForWorkspace(r.Context(), db.GetAgentRuntimeForWorkspaceParams{
-			ID:          runtimeUUID,
-			WorkspaceID: existing.WorkspaceID,
-		})
-		if err != nil {
-			writeError(w, http.StatusBadRequest, "invalid runtime_id")
-			return
-		}
+	var runtimePool []db.AgentRuntime
+	if poolIntent == runtimePoolSet {
 		// Same gate as CreateAgent — prevents UpdateAgent from being used to
 		// re-bind an agent onto someone else's private runtime, which would
-		// otherwise be a quiet end-run around the CreateAgent check.
+		// otherwise be a quiet end-run around the CreateAgent check. The pool
+		// resolver enforces workspace membership, visibility, no duplicates and
+		// the multi-provider rule; runtimePool[0] is the priority-0 projection.
 		member, ok := h.workspaceMember(w, r, uuidToString(existing.WorkspaceID))
 		if !ok {
 			return
 		}
-		if !canUseRuntimeForAgent(member, runtime) {
-			writeError(w, http.StatusForbidden, "this runtime is private; only its owner can move agents onto it")
+		pool, ok := h.resolveAgentRuntimePool(w, r, existing.WorkspaceID, member, poolIDs)
+		if !ok {
 			return
 		}
+		runtimePool = pool
+		runtime := pool[0]
 		params.RuntimeID = runtime.ID
 		params.RuntimeMode = pgtype.Text{String: runtime.RuntimeMode, Valid: true}
 		targetRuntimeID = runtime.ID
@@ -2042,7 +2101,7 @@ func (h *Handler) UpdateAgent(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Model != nil {
 		params.Model = pgtype.Text{String: *req.Model, Valid: true}
-	} else if req.RuntimeID != nil && existing.Model.Valid && agent.ModelKnownIncompatibleWithProvider(targetProvider, existing.Model.String) {
+	} else if poolIntent == runtimePoolSet && existing.Model.Valid && agent.ModelKnownIncompatibleWithProvider(targetProvider, existing.Model.String) {
 		// Model is runtime-native. When moving an agent across known provider
 		// families and the caller did not choose a replacement model, clear the
 		// old value so the new runtime falls back to its own default instead of
@@ -2092,7 +2151,7 @@ func (h *Handler) UpdateAgent(w http.ResponseWriter, r *http.Request) {
 			}
 			params.ThinkingLevel = pgtype.Text{String: value, Valid: true}
 		}
-	} else if req.RuntimeID != nil && existing.ThinkingLevel.Valid && existing.ThinkingLevel.String != "" {
+	} else if poolIntent == runtimePoolSet && existing.ThinkingLevel.Valid && existing.ThinkingLevel.String != "" {
 		// Runtime is changing but the caller didn't touch thinking_level.
 		// If the existing value is not in the new provider's enum at all,
 		// preserving it would smuggle a literal-invalid token to the daemon.
@@ -2166,7 +2225,7 @@ func (h *Handler) UpdateAgent(w http.ResponseWriter, r *http.Request) {
 			}
 			params.ServiceTier = pgtype.Text{String: value, Valid: true}
 		}
-	} else if req.RuntimeID != nil && existing.ServiceTier.Valid && existing.ServiceTier.String != "" {
+	} else if poolIntent == runtimePoolSet && existing.ServiceTier.Valid && existing.ServiceTier.String != "" {
 		provider := targetProvider
 		if provider == "" {
 			var ok bool
@@ -2280,6 +2339,28 @@ func (h *Handler) UpdateAgent(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Runtime pool (SE-37711 / SE-37664): the row update above already moved the
+	// legacy runtime_id projection to the priority-0 runtime (set) or a clear is
+	// handled here. Replace the ordered binding rows to match, or empty them and
+	// null the projection together. Done after the row update so the projection
+	// and the pool land in the same order the response reads them back.
+	switch poolIntent {
+	case runtimePoolSet:
+		if err := h.replaceAgentRuntimePool(r.Context(), updated.WorkspaceID, updated.ID, runtimePool); err != nil {
+			slog.Warn("update agent: replace runtime pool failed", append(logger.RequestAttrs(r), "error", err, "agent_id", id)...)
+			writeError(w, http.StatusInternalServerError, "failed to update runtime pool: "+err.Error())
+			return
+		}
+	case runtimePoolClear:
+		cleared, err := h.clearAgentRuntimePool(r.Context(), updated.ID)
+		if err != nil {
+			slog.Warn("update agent: clear runtime pool failed", append(logger.RequestAttrs(r), "error", err, "agent_id", id)...)
+			writeError(w, http.StatusInternalServerError, "failed to clear runtime pool: "+err.Error())
+			return
+		}
+		updated = cleared
+	}
+
 	// Invocation targets (MUL-3963): replace wholesale when the owner touched
 	// permission. Done after the row update so a permission_mode flip and its
 	// targets land together.
@@ -2295,6 +2376,11 @@ func (h *Handler) UpdateAgent(w http.ResponseWriter, r *http.Request) {
 	if err := h.enrichAgentResponseWithTargets(r.Context(), &resp, updated.ID); err != nil {
 		slog.Warn("update agent: load invocation targets for response failed", append(logger.RequestAttrs(r), "error", err, "agent_id", id)...)
 		writeError(w, http.StatusInternalServerError, "failed to load agent invocation targets")
+		return
+	}
+	if err := h.enrichAgentResponseWithRuntimeBindings(r.Context(), &resp, updated.ID); err != nil {
+		slog.Warn("update agent: load runtime bindings for response failed", append(logger.RequestAttrs(r), "error", err, "agent_id", id)...)
+		writeError(w, http.StatusInternalServerError, "failed to load agent runtime bindings")
 		return
 	}
 	// agentToResponse always initialises Skills as []; junction-table rows

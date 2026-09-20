@@ -179,6 +179,17 @@ UPDATE agent SET mcp_config = NULL, updated_at = now()
 WHERE id = $1
 RETURNING *;
 
+-- name: ClearAgentRuntimeID :one
+-- Explicit NULL-clear for the legacy runtime_id projection. COALESCE-based
+-- UpdateAgent cannot null a column, so an owner emptying an agent's runtime pool
+-- (runtime_id="" / runtime_ids=[]) routes the projection clear through here. The
+-- kind filter keeps this off system agents, whose builder runtime is rebound by
+-- RebindAgentBuilderRuntime rather than cleared. An unbound agent keeps its
+-- config and history and simply needs a new runtime before it can run (MUL-5559).
+UPDATE agent SET runtime_id = NULL, updated_at = now()
+WHERE id = $1 AND kind = 'user'
+RETURNING *;
+
 -- name: UpdateAgentCustomEnv :one
 -- Replaces an agent's custom_env map wholesale. Used by the dedicated
 -- env-management endpoint (POST/PUT /api/agents/{id}/env), which is the

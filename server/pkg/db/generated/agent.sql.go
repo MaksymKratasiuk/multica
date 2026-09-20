@@ -1855,6 +1855,55 @@ func (q *Queries) ClearAgentMcpConfig(ctx context.Context, id pgtype.UUID) (Agen
 	return i, err
 }
 
+const clearAgentRuntimeID = `-- name: ClearAgentRuntimeID :one
+UPDATE agent SET runtime_id = NULL, updated_at = now()
+WHERE id = $1 AND kind = 'user'
+RETURNING id, workspace_id, name, avatar_url, runtime_mode, runtime_config, visibility, status, max_concurrent_tasks, owner_id, created_at, updated_at, description, runtime_id, instructions, archived_at, archived_by, custom_env, custom_args, mcp_config, model, thinking_level, composio_toolkit_allowlist, permission_mode, kind, system_key, disabled_runtime_skills, service_tier, conversation_starters
+`
+
+// Explicit NULL-clear for the legacy runtime_id projection. COALESCE-based
+// UpdateAgent cannot null a column, so an owner emptying an agent's runtime pool
+// (runtime_id="" / runtime_ids=[]) routes the projection clear through here. The
+// kind filter keeps this off system agents, whose builder runtime is rebound by
+// RebindAgentBuilderRuntime rather than cleared. An unbound agent keeps its
+// config and history and simply needs a new runtime before it can run (MUL-5559).
+func (q *Queries) ClearAgentRuntimeID(ctx context.Context, id pgtype.UUID) (Agent, error) {
+	row := q.db.QueryRow(ctx, clearAgentRuntimeID, id)
+	var i Agent
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.Name,
+		&i.AvatarUrl,
+		&i.RuntimeMode,
+		&i.RuntimeConfig,
+		&i.Visibility,
+		&i.Status,
+		&i.MaxConcurrentTasks,
+		&i.OwnerID,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.Description,
+		&i.RuntimeID,
+		&i.Instructions,
+		&i.ArchivedAt,
+		&i.ArchivedBy,
+		&i.CustomEnv,
+		&i.CustomArgs,
+		&i.McpConfig,
+		&i.Model,
+		&i.ThinkingLevel,
+		&i.ComposioToolkitAllowlist,
+		&i.PermissionMode,
+		&i.Kind,
+		&i.SystemKey,
+		&i.DisabledRuntimeSkills,
+		&i.ServiceTier,
+		&i.ConversationStarters,
+	)
+	return i, err
+}
+
 const clearAgentServiceTier = `-- name: ClearAgentServiceTier :one
 UPDATE agent SET service_tier = NULL, updated_at = now()
 WHERE id = $1
