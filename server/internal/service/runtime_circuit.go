@@ -112,6 +112,36 @@ func circuitHeld(state string) bool {
 	}
 }
 
+// circuitHeldAt is the reset-aware hold decision the autopilot selector uses at
+// dispatch time (SE-37711 / SE-37664). Unlike circuitHeld it consults the reset
+// window so an ordered pool returns to a higher-priority runtime as soon as its
+// quota window elapses:
+//
+//   - closed: never holds.
+//   - half_open: holds. A probe is already testing the provider; a second
+//     concurrent automatic dispatch must not pile onto it.
+//   - open: holds until reset_at elapses. Once the window has passed the runtime
+//     is eligible again — the next task pinned there is the natural probe, whose
+//     terminal success closes the circuit and whose fresh failure reopens it with
+//     a new window (I7). An open row with no reset_at holds (nothing says when it
+//     is safe to retry).
+//
+// Autopilot dispatches are paced by their triggers, not a herd, so this
+// terminal-callback-driven probe needs no separate half-open lease on this path;
+// the exactly-one-probe lease (AcquireRuntimeProviderHalfOpenProbe) is reserved
+// for a future claim-path integration where many queued tasks would retry at
+// once.
+func circuitHeldAt(state string, resetAt time.Time, resetKnown bool, now time.Time) bool {
+	switch state {
+	case "half_open":
+		return true
+	case "open":
+		return !resetKnown || resetAt.After(now)
+	default:
+		return false
+	}
+}
+
 // fallbackOutcome is the result class of selecting a runtime from an agent's
 // ordered pool during automatic dispatch.
 type fallbackOutcome int

@@ -98,6 +98,36 @@ func TestCircuitHeld(t *testing.T) {
 	}
 }
 
+func TestCircuitHeldAt(t *testing.T) {
+	now := time.Date(2026, 9, 20, 12, 0, 0, 0, time.UTC)
+	future := now.Add(30 * time.Minute)
+	past := now.Add(-30 * time.Minute)
+
+	cases := []struct {
+		name       string
+		state      string
+		resetAt    time.Time
+		resetKnown bool
+		want       bool
+	}{
+		{"closed never holds", "closed", future, true, false},
+		{"empty state never holds", "", future, true, false},
+		{"half_open always holds", "half_open", past, true, true},
+		{"open holds until reset window elapses", "open", future, true, true},
+		{"open with elapsed window is eligible again", "open", past, true, false},
+		{"open at the exact reset instant is eligible", "open", now, true, false},
+		{"open without a known reset holds", "open", time.Time{}, false, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := circuitHeldAt(tc.state, tc.resetAt, tc.resetKnown, now); got != tc.want {
+				t.Errorf("circuitHeldAt(%q, reset=%s, known=%v) = %v, want %v",
+					tc.state, tc.resetAt, tc.resetKnown, got, tc.want)
+			}
+		})
+	}
+}
+
 func uuidFrom(b byte) pgtype.UUID {
 	var u pgtype.UUID
 	u.Valid = true
