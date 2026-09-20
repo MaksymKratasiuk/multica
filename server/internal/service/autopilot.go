@@ -978,6 +978,32 @@ func (e *errDispatchSkipped) Error() string { return e.reason }
 // applies also run here as belt-and-braces: if the leader changed between
 // admission and dispatch, or the runtime went offline in the gap, we still
 // fail closed instead of enqueueing a doomed task.
+// fallbackSummaryMarker flags on the task snapshot that a run_only dispatch was
+// routed to a runtime other than the agent's default by the quota-aware pool
+// selector. It keeps the automatic failover visible in every task-list response
+// and run/task detail instead of silent (SE-37711 / SE-37664, parent §5). The
+// task's runtime_id column already records which runtime ran; this marker is the
+// human-readable "why it moved" beside it.
+const fallbackSummaryMarker = " · via fallback runtime"
+
+// runOnlyTriggerSummary snapshots the autopilot title for a run_only task,
+// appending the failover marker when the pool selector fell over to a non-default
+// runtime. When it falls back, the title is truncated with the marker's width
+// reserved so the marker itself is never cut, and an empty title still yields a
+// visible marker.
+func runOnlyTriggerSummary(title string, fellBack bool) string {
+	if !fellBack {
+		return truncateForSummary(title, triggerSummaryMaxLen)
+	}
+	// Reserve the marker's width plus one rune for the ellipsis truncateForSummary
+	// appends when it cuts the title, so title+marker never exceeds the budget.
+	budget := triggerSummaryMaxLen - len([]rune(fallbackSummaryMarker)) - 1
+	if budget < 0 {
+		budget = 0
+	}
+	return truncateForSummary(title, budget) + fallbackSummaryMarker
+}
+
 func (s *AutopilotService) dispatchRunOnly(ctx context.Context, ap db.Autopilot, run *db.AutopilotRun, actorUserID pgtype.UUID) error {
 	agent, _, err := s.resolveAutopilotLeader(ctx, ap)
 	if err != nil {
@@ -996,6 +1022,7 @@ func (s *AutopilotService) dispatchRunOnly(ctx context.Context, ap db.Autopilot,
 	// (I8). Selection errors fail the run — no task is created — rather than
 	// routing work onto a runtime whose circuit could not be read.
 	selectedRuntime := agent.RuntimeID
+	fellBack := false
 	if actorUserID.Valid {
 		verdict, err := AgentReadiness(ctx, s.runtimeLookup(), agent)
 		if err != nil {
@@ -1012,6 +1039,20 @@ func (s *AutopilotService) dispatchRunOnly(ctx context.Context, ap db.Autopilot,
 		switch decision.Outcome {
 		case fallbackSelected:
 			selectedRuntime = decision.Chosen.RuntimeID
+			// A pick other than the agent's default runtime is an automatic
+			// quota/availability failover. Never silent (SE-37711 / SE-37664,
+			// parent §5): record it in the audit log now and mark the task
+			// snapshot below so run/task detail shows the reassignment.
+			if selectedRuntime != agent.RuntimeID {
+				fellBack = true
+				slog.Info("autopilot run_only auto-failover to fallback runtime",
+					"autopilot_id", util.UUIDToString(ap.ID),
+					"run_id", util.UUIDToString(run.ID),
+					"agent_id", util.UUIDToString(agent.ID),
+					"primary_runtime_id", util.UUIDToString(agent.RuntimeID),
+					"selected_runtime_id", util.UUIDToString(selectedRuntime),
+				)
+			}
 		case fallbackEmptyPool:
 			return &errDispatchSkipped{reason: formatAdmissionReason(ap, "agent has no runtime bound"), code: dispatch.ReasonAgentRuntimeRequired}
 		case fallbackAllHeld:
@@ -1065,8 +1106,8 @@ func (s *AutopilotService) dispatchRunOnly(ctx context.Context, ap db.Autopilot,
 		// without joining back to autopilot. Truncated for the same
 		// transmission-cost reason as comment-driven summaries.
 		TriggerSummary: pgtype.Text{
-			String: truncateForSummary(ap.Title, triggerSummaryMaxLen),
-			Valid:  ap.Title != "",
+			String: runOnlyTriggerSummary(ap.Title, fellBack),
+			Valid:  ap.Title != "" || fellBack,
 		},
 		OriginatorUserID:     autopilotAttr.UserID,
 		AccountableUserID:    autopilotAttr.AccountableUserID,
