@@ -41,43 +41,64 @@ func createPoolRuntime(t *testing.T, ctx context.Context, name, provider string)
 }
 
 // createForeignPrivateRuntime inserts a private runtime in the test workspace
-// owned by someone else, so the caller (the test user) fails the owner gate.
+// owned by someone else, so the caller (the test user) fails the owner gate. The
+// owner is a real user row (agent_runtime.owner_id has an FK to "user"), distinct
+// from testUserID so the owner check rejects.
 func createForeignPrivateRuntime(t *testing.T, ctx context.Context, name string) string {
 	t.Helper()
+	var ownerID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO "user" (name, email)
+		VALUES ($1, $2)
+		RETURNING id
+	`, name+" owner", name+"-owner@handler-test.invalid").Scan(&ownerID); err != nil {
+		t.Fatalf("insert foreign private runtime owner %q: %v", name, err)
+	}
 	var runtimeID string
 	if err := testPool.QueryRow(ctx, `
 		INSERT INTO agent_runtime (
 			workspace_id, daemon_id, name, runtime_mode, provider, status,
 			device_info, metadata, owner_id, visibility, last_seen_at
 		)
-		VALUES ($1, NULL, $2, 'cloud', 'anthropic', 'online', $3, '{}'::jsonb, gen_random_uuid(), 'private', now())
+		VALUES ($1, NULL, $2, 'cloud', 'anthropic', 'online', $3, '{}'::jsonb, $4, 'private', now())
 		RETURNING id
-	`, testWorkspaceID, name, name+" device").Scan(&runtimeID); err != nil {
+	`, testWorkspaceID, name, name+" device", ownerID).Scan(&runtimeID); err != nil {
 		t.Fatalf("insert foreign private runtime %q: %v", name, err)
 	}
 	t.Cleanup(func() {
 		testPool.Exec(context.Background(), `DELETE FROM agent_runtime WHERE id = $1`, runtimeID)
+		testPool.Exec(context.Background(), `DELETE FROM "user" WHERE id = $1`, ownerID)
 	})
 	return runtimeID
 }
 
 // createForeignWorkspaceRuntime inserts a runtime in a different workspace, so a
-// workspace-scoped lookup from the test workspace cannot see it.
+// workspace-scoped lookup from the test workspace cannot see it. The workspace is
+// a real row (agent_runtime.workspace_id has an FK to workspace).
 func createForeignWorkspaceRuntime(t *testing.T, ctx context.Context, name string) string {
 	t.Helper()
+	var workspaceID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO workspace (name, slug, description, issue_prefix)
+		VALUES ($1, $2, $3, $4)
+		RETURNING id
+	`, name+" workspace", name+"-ws", "foreign workspace for pool tests", "FWS").Scan(&workspaceID); err != nil {
+		t.Fatalf("insert foreign workspace %q: %v", name, err)
+	}
 	var runtimeID string
 	if err := testPool.QueryRow(ctx, `
 		INSERT INTO agent_runtime (
 			workspace_id, daemon_id, name, runtime_mode, provider, status,
 			device_info, metadata, owner_id, visibility, last_seen_at
 		)
-		VALUES (gen_random_uuid(), NULL, $1, 'cloud', 'anthropic', 'online', $2, '{}'::jsonb, $3, 'public', now())
+		VALUES ($1, NULL, $2, 'cloud', 'anthropic', 'online', $3, '{}'::jsonb, $4, 'public', now())
 		RETURNING id
-	`, name, name+" device", testUserID).Scan(&runtimeID); err != nil {
+	`, workspaceID, name, name+" device", testUserID).Scan(&runtimeID); err != nil {
 		t.Fatalf("insert foreign workspace runtime %q: %v", name, err)
 	}
 	t.Cleanup(func() {
 		testPool.Exec(context.Background(), `DELETE FROM agent_runtime WHERE id = $1`, runtimeID)
+		testPool.Exec(context.Background(), `DELETE FROM workspace WHERE id = $1`, workspaceID)
 	})
 	return runtimeID
 }
