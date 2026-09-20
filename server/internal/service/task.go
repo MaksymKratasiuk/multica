@@ -4440,6 +4440,11 @@ func (s *TaskService) CompleteTaskWithTransition(ctx context.Context, taskID pgt
 	slog.Info("task completed", "task_id", util.UUIDToString(task.ID), "issue_id", util.UUIDToString(task.IssueID))
 	s.captureTaskCompleted(ctx, task)
 
+	// SE-37711 / SE-37664: a terminal success closes this runtime's provider
+	// circuit — this is what promotes an open/half_open circuit back to closed
+	// after a probe succeeds. No-op when the circuit is already closed.
+	s.syncRuntimeCircuitOnSuccess(ctx, task)
+
 	// Invariant: every completed issue task must have at least one agent
 	// comment on the issue, so the user always sees something when a run
 	// ends. If the agent posted a comment during execution (result, progress
@@ -5068,6 +5073,13 @@ func (s *TaskService) FailTaskWithTransition(ctx context.Context, taskID pgtype.
 
 	slog.Warn("task failed", "task_id", util.UUIDToString(task.ID), "issue_id", util.UUIDToString(task.IssueID), "error", errMsg, "failure_reason", failureReason)
 	s.captureTaskFailed(ctx, task)
+
+	// SE-37711 / SE-37664: a provider quota or auth/access refusal on this
+	// runtime opens its provider circuit so the autopilot selector falls through
+	// to the next binding until the hold lapses. Best-effort and post-commit —
+	// the terminal status is already persisted; a non-quota/auth reason is a
+	// cheap no-op that never touches the DB.
+	s.syncRuntimeCircuitOnFailure(ctx, task, failureReason, errMsg)
 
 	// The auto-retry child (if any) was created inside the transaction above so
 	// no newer chat task could jump ahead of it. Surface it now: broadcast
