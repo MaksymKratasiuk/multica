@@ -1,9 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -638,6 +642,132 @@ func TestTaskRetentionDryRunRoundZeroDeletes(t *testing.T) {
 		if n != 1 {
 			t.Errorf("dry-run deleted the %s row (count=%d), expected it to survive", name, n)
 		}
+	}
+}
+
+// TestTaskRetentionDryRunRoundLogsExactSummary proves the operational log
+// oracle on the real round path: one event carries both status counts from the
+// shared DB snapshot, their total, the snapshot timestamp, and both configured
+// thresholds. It deliberately exercises sweepTaskRetention rather than a log
+// helper so a caller that drops either stage's result cannot satisfy the test.
+func TestTaskRetentionDryRunRoundLogsExactSummary(t *testing.T) {
+	requireDBTest(t)
+	fx := testutil.New(testPool, testWorkspaceID, testUserID)
+	agentID := fx.Agent(t, "task-retention-dryrun-summary-agent", "")
+
+	fx.Task(t, agentID, testutil.Cols{
+		"status":       "failed",
+		"completed_at": testutil.Raw("now() - interval '3650 days'"),
+	})
+	fx.Task(t, agentID, testutil.Cols{
+		"status":       "completed",
+		"completed_at": testutil.Raw("now() - interval '3650 days'"),
+	})
+
+	cfg := taskRetentionConfig{
+		FailedDays:    37,
+		CompletedDays: 91,
+		Cadence:       taskRetentionDefaultCadence,
+		BatchSize:     taskRetentionDefaultBatchSize,
+		DryRun:        true,
+	}
+	var logs bytes.Buffer
+	previousLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, nil)))
+	defer slog.SetDefault(previousLogger)
+
+	sweepTaskRetention(context.Background(), testPool, db.New(testPool), obsmetrics.NewBusinessMetrics(), cfg)
+
+	const summaryMessage = "agent task retention: dry-run candidates"
+	var summary map[string]any
+	summaryCount := 0
+	decoder := json.NewDecoder(&logs)
+	for {
+		var record map[string]any
+		if err := decoder.Decode(&record); err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			t.Fatalf("decode retention logs: %v\nlogs:\n%s", err, logs.String())
+		}
+		if record["msg"] == summaryMessage {
+			summary = record
+			summaryCount++
+		}
+	}
+	if summaryCount != 1 {
+		t.Fatalf("%q event count = %d, want 1\nlogs:\n%s", summaryMessage, summaryCount, logs.String())
+	}
+
+	expectedFields := map[string]bool{
+		"time": true, "level": true, "msg": true,
+		"failed": true, "completed": true, "total": true,
+		"as_of": true, "failed_days": true, "completed_days": true,
+	}
+	if len(summary) != len(expectedFields) {
+		t.Errorf("summary field count = %d, want %d: %#v", len(summary), len(expectedFields), summary)
+	}
+	for field := range summary {
+		if !expectedFields[field] {
+			t.Errorf("summary contains unexpected field %q: %#v", field, summary)
+		}
+	}
+	for field := range expectedFields {
+		if _, ok := summary[field]; !ok {
+			t.Errorf("summary missing field %q: %#v", field, summary)
+		}
+	}
+	if summary["level"] != "INFO" {
+		t.Errorf("summary level = %#v, want INFO", summary["level"])
+	}
+
+	requireNumber := func(field string) float64 {
+		t.Helper()
+		value, ok := summary[field].(float64)
+		if !ok {
+			t.Fatalf("summary field %q = %#v (%T), want JSON number", field, summary[field], summary[field])
+		}
+		return value
+	}
+	failed := requireNumber("failed")
+	completed := requireNumber("completed")
+	if total := requireNumber("total"); total != failed+completed {
+		t.Errorf("summary total = %v, want failed + completed = %v", total, failed+completed)
+	}
+	if got := requireNumber("failed_days"); got != float64(cfg.FailedDays) {
+		t.Errorf("summary failed_days = %v, want %d", got, cfg.FailedDays)
+	}
+	if got := requireNumber("completed_days"); got != float64(cfg.CompletedDays) {
+		t.Errorf("summary completed_days = %v, want %d", got, cfg.CompletedDays)
+	}
+
+	asOfText, ok := summary["as_of"].(string)
+	if !ok {
+		t.Fatalf("summary as_of = %#v (%T), want RFC3339 timestamp", summary["as_of"], summary["as_of"])
+	}
+	asOfTime, err := time.Parse(time.RFC3339Nano, asOfText)
+	if err != nil {
+		t.Fatalf("parse summary as_of %q: %v", asOfText, err)
+	}
+	asOf := pgtype.Timestamptz{Time: asOfTime, Valid: true}
+	queries := db.New(testPool)
+	wantFailed, err := queries.CountFailedTaskRetentionCandidates(context.Background(), db.CountFailedTaskRetentionCandidatesParams{
+		AsOf: asOf, FailedDays: cfg.FailedDays,
+	})
+	if err != nil {
+		t.Fatalf("recount failed candidates at logged as_of: %v", err)
+	}
+	wantCompleted, err := queries.CountCompletedTaskRetentionCandidates(context.Background(), db.CountCompletedTaskRetentionCandidatesParams{
+		AsOf: asOf, CompletedDays: cfg.CompletedDays,
+	})
+	if err != nil {
+		t.Fatalf("recount completed candidates at logged as_of: %v", err)
+	}
+	if failed != float64(wantFailed) {
+		t.Errorf("summary failed = %v, want exact count %d at logged as_of", failed, wantFailed)
+	}
+	if completed != float64(wantCompleted) {
+		t.Errorf("summary completed = %v, want exact count %d at logged as_of", completed, wantCompleted)
 	}
 }
 
