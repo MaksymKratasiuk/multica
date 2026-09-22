@@ -233,8 +233,10 @@ func sweepTaskRetention(ctx context.Context, pool *pgxpool.Pool, queries *db.Que
 	}
 
 	result := obsmetrics.TaskRetentionResultSuccess
+	var failedCandidates, completedCandidates int64
 	for _, stage := range stages {
-		if err := runTaskRetentionStage(roundCtx, pool, queries, metrics, cfg, asOf, stage); err != nil {
+		candidates, err := runTaskRetentionStage(roundCtx, pool, queries, metrics, cfg, asOf, stage)
+		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				slog.Info("task retention: round context ended", "status", stage.status, "error", err)
 			} else {
@@ -243,6 +245,24 @@ func sweepTaskRetention(ctx context.Context, pool *pgxpool.Pool, queries *db.Que
 			result = obsmetrics.TaskRetentionResultFailure
 			break
 		}
+		if cfg.DryRun {
+			switch stage.status {
+			case obsmetrics.TaskRetentionStatusFailed:
+				failedCandidates = candidates
+			case obsmetrics.TaskRetentionStatusCompleted:
+				completedCandidates = candidates
+			}
+		}
+	}
+	if cfg.DryRun && result == obsmetrics.TaskRetentionResultSuccess {
+		slog.Info("agent task retention: dry-run candidates",
+			"failed", failedCandidates,
+			"completed", completedCandidates,
+			"total", failedCandidates+completedCandidates,
+			"as_of", asOf.Time,
+			"failed_days", cfg.FailedDays,
+			"completed_days", cfg.CompletedDays,
+		)
 	}
 	metrics.RecordTaskRetentionRun(mode, result, time.Since(startedAt))
 }
@@ -251,10 +271,10 @@ func sweepTaskRetention(ctx context.Context, pool *pgxpool.Pool, queries *db.Que
 // logs candidates (dry-run) or drains eligible rows in bounded batches
 // (delete). A batch error aborts the stage without swallowing it, so the round
 // stops rather than looping on a broken transaction.
-func runTaskRetentionStage(ctx context.Context, pool *pgxpool.Pool, queries *db.Queries, metrics *obsmetrics.BusinessMetrics, cfg taskRetentionConfig, asOf pgtype.Timestamptz, stage taskRetentionStage) error {
+func runTaskRetentionStage(ctx context.Context, pool *pgxpool.Pool, queries *db.Queries, metrics *obsmetrics.BusinessMetrics, cfg taskRetentionConfig, asOf pgtype.Timestamptz, stage taskRetentionStage) (int64, error) {
 	candidates, err := stage.count(ctx, asOf)
 	if err != nil {
-		return fmt.Errorf("count %s candidates: %w", stage.status, err)
+		return 0, fmt.Errorf("count %s candidates: %w", stage.status, err)
 	}
 	metrics.SetTaskRetentionCandidateRows(stage.status, candidates)
 
@@ -264,18 +284,18 @@ func runTaskRetentionStage(ctx context.Context, pool *pgxpool.Pool, queries *db.
 			"candidate_rows", candidates,
 			"mode", obsmetrics.TaskRetentionModeDryRun,
 		)
-		return nil
+		return candidates, nil
 	}
 
 	purged := 0
 	backoff := taskRetentionInitialBackoff
 	for {
 		if err := ctx.Err(); err != nil {
-			return err
+			return candidates, err
 		}
 		deleted, err := deleteTaskRetentionBatch(ctx, pool, queries, cfg, asOf, stage)
 		if err != nil {
-			return fmt.Errorf("delete %s batch: %w", stage.status, err)
+			return candidates, fmt.Errorf("delete %s batch: %w", stage.status, err)
 		}
 		if deleted > 0 {
 			purged += deleted
@@ -288,7 +308,7 @@ func runTaskRetentionStage(ctx context.Context, pool *pgxpool.Pool, queries *db.
 		// was SKIP LOCKED by concurrent work. Re-count to tell them apart.
 		remaining, err := stage.count(ctx, asOf)
 		if err != nil {
-			return fmt.Errorf("recount %s candidates: %w", stage.status, err)
+			return candidates, fmt.Errorf("recount %s candidates: %w", stage.status, err)
 		}
 		if remaining == 0 {
 			break
@@ -301,7 +321,7 @@ func runTaskRetentionStage(ctx context.Context, pool *pgxpool.Pool, queries *db.
 		// round as a failure (fail-stop), never a success that leaves eligible
 		// rows behind.
 		if err := sleepWithContext(ctx, backoff); err != nil {
-			return err
+			return candidates, err
 		}
 		if backoff *= 2; backoff > taskRetentionMaxBackoff {
 			backoff = taskRetentionMaxBackoff
@@ -313,7 +333,7 @@ func runTaskRetentionStage(ctx context.Context, pool *pgxpool.Pool, queries *db.
 		"purged", purged,
 		"mode", obsmetrics.TaskRetentionModeDelete,
 	)
-	return nil
+	return candidates, nil
 }
 
 // deleteTaskRetentionBatch deletes one bounded batch inside a short transaction

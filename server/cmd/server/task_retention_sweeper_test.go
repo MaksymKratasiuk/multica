@@ -965,7 +965,7 @@ func TestTaskRetentionBatchFailureRollsBackAndResumes(t *testing.T) {
 		},
 	}
 
-	err = runTaskRetentionStage(ctx, testPool, queries, obsmetrics.NewBusinessMetrics(), cfg, asOf, failing)
+	_, err = runTaskRetentionStage(ctx, testPool, queries, obsmetrics.NewBusinessMetrics(), cfg, asOf, failing)
 	if !errors.Is(err, injected) {
 		t.Fatalf("expected injected error to propagate (fail-stop), got %v", err)
 	}
