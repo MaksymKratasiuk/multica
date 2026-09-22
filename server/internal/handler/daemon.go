@@ -4881,11 +4881,12 @@ func (h *Handler) ReportTaskUsage(w http.ResponseWriter, r *http.Request) {
 }
 
 // dispatchModelActions is the closed set of model fail-safe outcomes the daemon
-// may report (SE-37741 F8). "kept" is excluded: the daemon reports only when the
-// pin actually changed, so a "kept" here is a malformed report. The allowlist is
-// a trust boundary — the value lands in the audit jsonb, so an unknown label is
-// rejected rather than persisted.
+// may report (SE-37741/SE-37873 F8). "kept" is valid because every automatic
+// route now records the exact outcome before execution, including an exact pin
+// that the authoritative target catalog admitted. The allowlist is a trust
+// boundary — the value lands in the audit jsonb, so unknown labels are rejected.
 var dispatchModelActions = map[string]struct{}{
+	"kept":                 {},
 	"qualified":            {},
 	"cleared_incompatible": {},
 	"cleared_unresolved":   {},
@@ -4895,7 +4896,8 @@ var dispatchModelActions = map[string]struct{}{
 // (F8) into this task's runtime-failover audit (F6). Called independently of
 // complete/fail because the model is resolved at pickup, before the agent runs.
 // The merge no-ops unless the task carries a failover audit, so an ordinary
-// dispatch is never stamped with a stray audit.
+// dispatch is never stamped with a stray audit; the daemon treats failure to
+// persist an audited outcome as a pre-launch failure.
 func (h *Handler) ReportTaskDispatchModelAction(w http.ResponseWriter, r *http.Request) {
 	taskID := chi.URLParam(r, "taskId")
 

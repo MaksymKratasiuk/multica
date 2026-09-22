@@ -163,11 +163,10 @@ const (
 	// fallbackNoneAvailable: no binding is held, but none is ready either
 	// (offline / access-denied). This is a readiness skip, not a breaker skip.
 	fallbackNoneAvailable
-	// fallbackAuthHeld: the primary (highest-priority) runtime is held by an
-	// auth/access circuit. Auth never auto-switches to a fallback (F3): a broken
-	// or revoked credential is an operator-fix signal, not a rate window that
-	// lapses on its own, so dispatch is skipped and held on the primary's window
-	// instead of draining its work onto a lower-priority binding.
+	// fallbackAuthHeld: the ordered walk reached an auth/access-held runtime
+	// before finding a target. Auth never auto-switches past that binding (F3):
+	// a broken or revoked credential is an operator-fix signal, not a rate window
+	// that lapses on its own.
 	fallbackAuthHeld
 )
 
@@ -186,9 +185,9 @@ type runtimeCandidate struct {
 	// Held is true when the runtime's provider circuit still parks dispatch.
 	Held bool
 	// HeldClass is the open circuit's failure class (circuitClassQuota /
-	// circuitClassAuth) when Held; empty otherwise. The selector reads it so an
-	// auth/access hold on the primary skips without a fallback (F3) while a quota
-	// hold still falls through to the next binding.
+	// circuitClassAuth) when Held; empty otherwise. The selector reads it so the
+	// first auth/access hold reached before a target stops selection (F3), while
+	// a quota hold still falls through to the next binding.
 	HeldClass string
 	// HoldUntil is when the hold lapses, for earliest-reset reporting. The zero
 	// value means "unknown" (e.g. a half_open probe with no deadline) and must
@@ -240,29 +239,25 @@ func selectFallbackRuntime(candidates []runtimeCandidate) fallbackDecision {
 	if len(candidates) == 0 {
 		return fallbackDecision{Outcome: fallbackEmptyPool}
 	}
-	// Auth no-switch (F3): a broken credential or revoked access on the PRIMARY
-	// runtime is an operator-fix signal, not a rate window that lapses on its
-	// own. Automatically draining the primary's work onto a lower-priority
-	// binding would mask the revocation and risk cascading the bad credential
-	// across the pool, so an auth/access hold on the highest-priority candidate
-	// skips the whole dispatch and holds — never a fallback. A quota hold is the
-	// opposite (the provider is temporarily capped), so it falls through to the
-	// next binding in the ordinary walk below.
-	if primary := candidates[0]; primary.Held && primary.HeldClass == circuitClassAuth {
-		return fallbackDecision{
-			Outcome:       fallbackAuthHeld,
-			EarliestReset: primary.HoldUntil,
-			EarliestKnown: !primary.HoldUntil.IsZero(),
-			HeldCount:     1,
-			Candidates:    candidates,
-		}
-	}
 	var (
 		heldCount     int
 		earliest      time.Time
 		earliestKnown bool
 	)
 	for _, c := range candidates {
+		// Auth no-switch (F3) applies to the ordered selection path, not only
+		// candidates[0]. Quota may move the walk forward, but once the first
+		// auth/access-held binding is reached before a target, continuing to a
+		// lower runtime would mask an operator-fix credential failure.
+		if c.Held && c.HeldClass == circuitClassAuth {
+			return fallbackDecision{
+				Outcome:       fallbackAuthHeld,
+				EarliestReset: c.HoldUntil,
+				EarliestKnown: !c.HoldUntil.IsZero(),
+				HeldCount:     heldCount + 1,
+				Candidates:    candidates,
+			}
+		}
 		if c.Available && !c.Held {
 			return fallbackDecision{Outcome: fallbackSelected, Chosen: c, Candidates: candidates}
 		}

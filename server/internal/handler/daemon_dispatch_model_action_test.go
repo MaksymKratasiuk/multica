@@ -126,10 +126,11 @@ func TestReportTaskDispatchModelActionEndpoint(t *testing.T) {
 		map[string]string{"model_action": "bogus"})
 	testutil.Call(t, testHandler.ReportTaskDispatchModelAction, badReq).Want(http.StatusBadRequest)
 
-	// Valid action is accepted and persisted into the existing audit.
+	// "kept" is a valid exact outcome for a fallback pin admitted by the
+	// authoritative target catalog, and must be persisted too.
 	okReq := daemonTaskRequest(t,
 		"/api/daemon/tasks/"+taskID+"/dispatch-model-action", taskID,
-		map[string]string{"model_action": "cleared_unresolved"})
+		map[string]string{"model_action": "kept"})
 	testutil.Call(t, testHandler.ReportTaskDispatchModelAction, okReq).Want(http.StatusOK)
 
 	var raw []byte
@@ -139,8 +140,8 @@ func TestReportTaskDispatchModelActionEndpoint(t *testing.T) {
 	if err := json.Unmarshal(raw, &got); err != nil {
 		t.Fatalf("audit not json: %v (%s)", err, raw)
 	}
-	if got["model_action"] != "cleared_unresolved" {
-		t.Errorf("model_action = %v, want cleared_unresolved", got["model_action"])
+	if got["model_action"] != "kept" {
+		t.Errorf("model_action = %v, want kept", got["model_action"])
 	}
 }
 

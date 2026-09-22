@@ -110,6 +110,19 @@ const (
 	idleWatchdogMaxTick = 5 * time.Minute
 )
 
+func automaticRuntimeFallback(audit json.RawMessage) bool {
+	if len(audit) == 0 {
+		return false
+	}
+	var marker struct {
+		Reason string `json:"reason"`
+	}
+	if err := json.Unmarshal(audit, &marker); err != nil {
+		return false
+	}
+	return marker.Reason == "runtime_failover" || marker.Reason == "failover_half_open_probe"
+}
+
 // pendingWorkHintMinInterval is the floor between two hint-driven heartbeats
 // for the same runtime. Keeps an interactive first open instant while stopping a
 // caller-triggered hint from becoming a heartbeat amplifier. A var so tests can
@@ -7534,6 +7547,7 @@ func resolveTaskModelSelection(
 	provider string,
 	runtimeCmd agent.Command,
 	sel taskModelSelection,
+	automaticFallback bool,
 	taskLog *slog.Logger,
 ) (taskModelSelection, string) {
 	// A runtime-scoped quota/auth circuit can route this execution onto a
@@ -7546,9 +7560,9 @@ func resolveTaskModelSelection(
 	// persisted configuration is left untouched. This static classification
 	// reads no CLI subprocess, preserving the at-most-one discovery read below;
 	// unknown or custom ids it cannot confidently place fall through to the live
-	// catalog check further down (which only runs when the catalog is read for
-	// another reason).
-	if sel.Model != "" && agent.ModelKnownIncompatibleWithProvider(provider, sel.Model) {
+	// catalog check further down. Ordinary primary/manual execution skips this
+	// fallback-only guard and retains the long-standing custom-pin behavior.
+	if automaticFallback && sel.Model != "" && agent.ModelKnownIncompatibleWithProvider(provider, sel.Model) {
 		taskLog.Info("model: persisted pin is incompatible with the selected runtime provider; using the runtime default for this execution",
 			"provider", provider,
 			"configured_model", sel.Model,
@@ -7573,29 +7587,51 @@ func resolveTaskModelSelection(
 	}
 
 	before := sel.Model
-	sel.Model = qualifyTaskModel(provider, sel.Model, capabilityChecksPending, loadCatalog, taskLog)
 	modelAction := modelActionKept
-	if sel.Model != before {
-		modelAction = modelActionQualified
-	}
-
-	// Live-catalog fail-safe (SE-37741 F8). When qualification actually read the
-	// runtime's catalog and it came back usable (no error, not a static
-	// fallback), a pin that resolves to neither an exact nor a uniquely-qualified
-	// entry is unknown / ambiguous / unavailable to this runtime — the shape a
-	// cross-provider fallback produces. Launching it would fail the CLI, so clear
-	// it and its capability overrides to the runtime default for this execution.
-	// This adds no catalog read: it reuses the one qualification already took, so
-	// tasks that never read the catalog (claude/codex with no override, pinned
-	// or not) keep the manual-entry pass-through the static check leaves them.
-	if sel.Model != "" && read && catalogErr == nil && !catalog.Fallback && !modelInCatalog(catalog, sel.Model) {
-		taskLog.Info("model: persisted pin is not in the selected runtime's live catalog; using the runtime default for this execution",
-			"provider", provider,
-			"configured_model", sel.Model,
-			"catalog_models", len(catalog.Models),
-			"model_action", modelActionClearedUnresolved,
-		)
-		return taskModelSelection{}, modelActionClearedUnresolved
+	if automaticFallback {
+		// F8 is deliberately fallback-only. An automatic cross-runtime/provider
+		// route may execute a saved pin against a different account/provider, so
+		// only an authoritative live catalog can admit it. Fallback/empty/error
+		// catalogs, unknown/ambiguous pins, and unavailable models all fail safe to
+		// the target runtime default together with thinking/tier. Primary/manual
+		// executions stay on the long-standing pass-through behavior below.
+		if sel.Model == "" {
+			if capabilityChecksPending {
+				return taskModelSelection{}, modelActionClearedUnresolved
+			}
+		} else {
+			liveCatalog, err := loadCatalog()
+			if err != nil || liveCatalog.Fallback || len(liveCatalog.Models) == 0 {
+				taskLog.Warn("model: fallback runtime catalog is not authoritative; using the runtime default for this execution",
+					"provider", provider,
+					"configured_model", sel.Model,
+					"catalog_fallback", liveCatalog.Fallback,
+					"catalog_models", len(liveCatalog.Models),
+					"error", err,
+					"model_action", modelActionClearedUnresolved,
+				)
+				return taskModelSelection{}, modelActionClearedUnresolved
+			}
+			qualified, rewritten := agent.QualifyModelID(liveCatalog, sel.Model)
+			if rewritten {
+				sel.Model = qualified
+				modelAction = modelActionQualified
+			}
+			if !modelInCatalog(liveCatalog, sel.Model) {
+				taskLog.Info("model: persisted pin is not in the fallback runtime's live catalog; using the runtime default for this execution",
+					"provider", provider,
+					"configured_model", before,
+					"catalog_models", len(liveCatalog.Models),
+					"model_action", modelActionClearedUnresolved,
+				)
+				return taskModelSelection{}, modelActionClearedUnresolved
+			}
+		}
+	} else {
+		sel.Model = qualifyTaskModel(provider, sel.Model, capabilityChecksPending, loadCatalog, taskLog)
+		if sel.Model != before {
+			modelAction = modelActionQualified
+		}
 	}
 
 	// service_tier is catalog-owned and currently Codex-only. As with
@@ -8704,26 +8740,29 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		thinkingLevel = task.Agent.ThinkingLevel
 		serviceTier = task.Agent.ServiceTier
 	}
+	automaticFallback := automaticRuntimeFallback(task.DispatchRuntimeAudit)
 	selection, modelAction := resolveTaskModelSelection(ctx, provider, agent.NewCommand(entry.Path, profileFixedArgs),
-		taskModelSelection{Model: model, ThinkingLevel: thinkingLevel, ServiceTier: serviceTier}, taskLog)
+		taskModelSelection{Model: model, ThinkingLevel: thinkingLevel, ServiceTier: serviceTier}, automaticFallback, taskLog)
 	model, thinkingLevel, serviceTier = selection.Model, selection.ThinkingLevel, selection.ServiceTier
-	if modelAction != modelActionKept {
-		// Durable per-execution audit of the fallback model decision (SE-37741
-		// F8): a cleared or qualified pin is a routing event operators need to
-		// see, not just a debug detail.
+	if modelAction != modelActionKept || len(task.DispatchRuntimeAudit) > 0 {
+		// Durable per-execution audit of the fallback model decision (SE-37741 /
+		// SE-37873 F8): kept, qualified, and cleared outcomes are routing evidence
+		// operators need to see, not just debug detail.
 		taskLog.Info("task model selection resolved",
 			"task_id", task.ID,
 			"provider", provider,
 			"model_action", modelAction,
 			"model", model,
 		)
-		// Enrich this task's runtime-failover audit (F6) with the model action.
-		// Best-effort and independent of the terminal callback: the merge no-ops
-		// unless the task actually failed over, so a lost report only drops
-		// enrichment, never correctness.
-		if err := d.client.ReportTaskDispatchModelAction(ctx, task.ID, modelAction); err != nil {
-			taskLog.Warn("report task dispatch model action failed",
-				"task_id", task.ID, "model_action", modelAction, "error", err)
+		// Every audited automatic route persists an exact model_action before
+		// launching the provider. Failing closed here prevents the fallback from
+		// executing with only a best-effort log when the durable evidence write is
+		// unavailable (F6/F8). Ordinary tasks have no audit and keep their existing
+		// behavior.
+		if len(task.DispatchRuntimeAudit) > 0 {
+			if err := d.client.ReportTaskDispatchModelAction(ctx, task.ID, modelAction); err != nil {
+				return TaskResult{}, fmt.Errorf("record task dispatch model action: %w", err)
+			}
 		}
 	}
 

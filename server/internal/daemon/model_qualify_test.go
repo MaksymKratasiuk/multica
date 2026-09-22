@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"sync"
@@ -174,7 +175,7 @@ func TestResolveTaskModelSelectionReadsTheCatalogAtMostOnce(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			reads := stubModelDiscovery(t, thinkingCatalogs())
 
-			got, _ := resolveTaskModelSelection(context.Background(), tt.provider, agent.Command{}, tt.in, quietTaskLog())
+			got, _ := resolveTaskModelSelection(context.Background(), tt.provider, agent.Command{}, tt.in, false, quietTaskLog())
 			if got != tt.want {
 				t.Errorf("resolveTaskModelSelection(%s, %+v) = %+v, want %+v", tt.provider, tt.in, got, tt.want)
 			}
@@ -192,8 +193,8 @@ func TestResolveTaskModelSelectionReadsTheCatalogAtMostOnce(t *testing.T) {
 // dropped for this execution so the runtime launches with its own default model
 // — the gpt-5.6-sol → Claude pin must never reach the CLI. The static-catalog
 // classification does this without any discovery subprocess, so a dropped pin
-// costs zero catalog reads; unknown/custom ids the server cannot confidently
-// classify pass through untouched.
+// costs zero catalog reads. The remaining table rows pin the complementary
+// scope rule: ordinary primary/manual pins keep their historical pass-through.
 func TestResolveTaskModelSelectionDropsCrossProviderIncompatibleModel(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -201,6 +202,7 @@ func TestResolveTaskModelSelectionDropsCrossProviderIncompatibleModel(t *testing
 		in        taskModelSelection
 		want      taskModelSelection
 		wantReads int
+		fallback  bool
 	}{
 		{
 			// The canonical failure the fallback must prevent: an OpenAI/Codex
@@ -210,6 +212,7 @@ func TestResolveTaskModelSelectionDropsCrossProviderIncompatibleModel(t *testing
 			in:        taskModelSelection{Model: "gpt-5.6-sol"},
 			want:      taskModelSelection{Model: ""},
 			wantReads: 0,
+			fallback:  true,
 		},
 		{
 			name:      "claude model on a codex runtime is dropped",
@@ -217,6 +220,7 @@ func TestResolveTaskModelSelectionDropsCrossProviderIncompatibleModel(t *testing
 			in:        taskModelSelection{Model: "claude-opus-5"},
 			want:      taskModelSelection{Model: ""},
 			wantReads: 0,
+			fallback:  true,
 		},
 		{
 			// A context-window variant is the same Claude model; it stays.
@@ -248,7 +252,7 @@ func TestResolveTaskModelSelectionDropsCrossProviderIncompatibleModel(t *testing
 		t.Run(tt.name, func(t *testing.T) {
 			reads := stubModelDiscovery(t, thinkingCatalogs())
 
-			got, _ := resolveTaskModelSelection(context.Background(), tt.provider, agent.Command{}, tt.in, quietTaskLog())
+			got, _ := resolveTaskModelSelection(context.Background(), tt.provider, agent.Command{}, tt.in, tt.fallback, quietTaskLog())
 			if got != tt.want {
 				t.Errorf("resolveTaskModelSelection(%s, %+v) = %+v, want %+v", tt.provider, tt.in, got, tt.want)
 			}
@@ -299,6 +303,15 @@ func TestResolveTaskModelSelectionClearsPinUnresolvableAgainstLiveCatalog(t *tes
 			provider:   "opencode",
 			catalogs:   map[string]agent.Catalog{"opencode": {Models: []agent.Model{gatewayOpus}}},
 			in:         taskModelSelection{Model: "gpt-5.6-sol"},
+			want:       taskModelSelection{},
+			wantAction: modelActionClearedUnresolved,
+			wantReads:  1,
+		},
+		{
+			name:       "unknown custom pin on claude fallback is cleared against live catalog",
+			provider:   "claude",
+			catalogs:   map[string]agent.Catalog{"claude": {Models: []agent.Model{{ID: "claude-opus-5", Provider: "claude"}}}},
+			in:         taskModelSelection{Model: "my-custom-pin", ThinkingLevel: "high", ServiceTier: "priority"},
 			want:       taskModelSelection{},
 			wantAction: modelActionClearedUnresolved,
 			wantReads:  1,
@@ -358,14 +371,15 @@ func TestResolveTaskModelSelectionClearsPinUnresolvableAgainstLiveCatalog(t *tes
 			wantReads:  1,
 		},
 		{
-			// A static fallback catalog is a stand-in, not the runtime's real
-			// list — it must never be the basis for erasing a pin.
-			name:       "fallback catalog does not clear the pin",
+			// A static fallback catalog is not authoritative enough to admit a
+			// pin on an automatic runtime fallback, so fail safe to the target
+			// runtime's default together with capability overrides.
+			name:       "fallback catalog clears the pin fail-safe",
 			provider:   "opencode",
 			catalogs:   map[string]agent.Catalog{"opencode": {Fallback: true, Models: []agent.Model{gatewayOpus}}},
-			in:         taskModelSelection{Model: "some-unlisted-model"},
-			want:       taskModelSelection{Model: "some-unlisted-model"},
-			wantAction: modelActionKept,
+			in:         taskModelSelection{Model: "some-unlisted-model", ThinkingLevel: "high", ServiceTier: "priority"},
+			want:       taskModelSelection{},
+			wantAction: modelActionClearedUnresolved,
 			wantReads:  1,
 		},
 	}
@@ -374,7 +388,7 @@ func TestResolveTaskModelSelectionClearsPinUnresolvableAgainstLiveCatalog(t *tes
 		t.Run(tt.name, func(t *testing.T) {
 			reads := stubModelDiscovery(t, tt.catalogs)
 
-			got, action := resolveTaskModelSelection(context.Background(), tt.provider, agent.Command{}, tt.in, quietTaskLog())
+			got, action := resolveTaskModelSelection(context.Background(), tt.provider, agent.Command{}, tt.in, true, quietTaskLog())
 			if got != tt.want {
 				t.Errorf("selection = %+v, want %+v", got, tt.want)
 			}
@@ -388,11 +402,10 @@ func TestResolveTaskModelSelectionClearsPinUnresolvableAgainstLiveCatalog(t *tes
 	}
 }
 
-// A runtime that cannot answer must not block the task: the persisted model
-// may well be exactly what its CLI expects, and a stale-looking capability
-// override is kept rather than silently dropped on a transient failure. The
-// failed read is still only attempted once.
-func TestResolveTaskModelSelectionFailsOpenOnDiscoveryError(t *testing.T) {
+// Automatic runtime fallback is fail-safe: an unavailable catalog cannot
+// authorize a provider-specific pin, so the execution drops the pin and its
+// overrides to the target runtime default. The failed read is attempted once.
+func TestResolveTaskModelSelectionClearsOnFallbackDiscoveryError(t *testing.T) {
 	var mu sync.Mutex
 	calls := 0
 
@@ -406,17 +419,49 @@ func TestResolveTaskModelSelectionFailsOpenOnDiscoveryError(t *testing.T) {
 	t.Cleanup(func() { listModels = orig })
 
 	in := taskModelSelection{Model: "claude/claude-opus-5", ThinkingLevel: "high"}
-	got, action := resolveTaskModelSelection(context.Background(), "opencode", agent.Command{}, in, quietTaskLog())
-	if got != in {
-		t.Errorf("resolveTaskModelSelection on discovery error = %+v, want %+v unchanged", got, in)
+	got, action := resolveTaskModelSelection(context.Background(), "opencode", agent.Command{}, in, true, quietTaskLog())
+	if got != (taskModelSelection{}) {
+		t.Errorf("resolveTaskModelSelection on fallback discovery error = %+v, want runtime default", got)
 	}
-	if action != modelActionKept {
-		t.Errorf("model_action on discovery error = %q, want %q — a failed read must not clear the pin", action, modelActionKept)
+	if action != modelActionClearedUnresolved {
+		t.Errorf("model_action on discovery error = %q, want %q", action, modelActionClearedUnresolved)
 	}
 
 	mu.Lock()
 	defer mu.Unlock()
 	if calls != 1 {
 		t.Errorf("catalog reads = %d, want 1 — a failed read must not be retried within the task", calls)
+	}
+}
+
+func TestResolveTaskModelSelectionLeavesOrdinaryCustomPinUnchanged(t *testing.T) {
+	reads := stubModelDiscovery(t, map[string]agent.Catalog{})
+	in := taskModelSelection{Model: "my-company/custom-claude-model"}
+	got, action := resolveTaskModelSelection(context.Background(), "claude", agent.Command{}, in, false, quietTaskLog())
+	if got != in || action != modelActionKept {
+		t.Fatalf("ordinary primary/manual selection = %+v action=%q, want unchanged %+v/%q", got, action, in, modelActionKept)
+	}
+	if reads() != 0 {
+		t.Fatalf("ordinary custom pin catalog reads = %d, want 0", reads())
+	}
+}
+
+func TestAutomaticRuntimeFallbackUsesDurableRouteReason(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		audit json.RawMessage
+		want  bool
+	}{
+		{name: "fallback", audit: json.RawMessage(`{"reason":"runtime_failover"}`), want: true},
+		{name: "fallback probe", audit: json.RawMessage(`{"reason":"failover_half_open_probe"}`), want: true},
+		{name: "primary probe", audit: json.RawMessage(`{"reason":"half_open_probe"}`), want: false},
+		{name: "ordinary", want: false},
+		{name: "malformed", audit: json.RawMessage(`{`), want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := automaticRuntimeFallback(tc.audit); got != tc.want {
+				t.Fatalf("automaticRuntimeFallback(%s) = %v, want %v", tc.audit, got, tc.want)
+			}
+		})
 	}
 }

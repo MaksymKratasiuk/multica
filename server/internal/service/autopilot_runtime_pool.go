@@ -180,18 +180,25 @@ func (s *AutopilotService) createRunOnlyTask(ctx context.Context, chosen runtime
 	return task, nil
 }
 
-func (s *AutopilotService) acquireProbeAndCreate(ctx context.Context, q *db.Queries, chosen runtimeCandidate, params db.CreateAutopilotTaskParams) (db.AgentTaskQueue, error) {
+func acquireHalfOpenProbe(ctx context.Context, q *db.Queries, chosen runtimeCandidate, taskID pgtype.UUID) error {
 	rows, err := q.AcquireRuntimeProviderHalfOpenProbe(ctx, db.AcquireRuntimeProviderHalfOpenProbeParams{
 		RuntimeID:      chosen.RuntimeID,
 		Provider:       chosen.Provider,
-		ProbeTaskID:    params.ID,
+		ProbeTaskID:    taskID,
 		ProbeExpiresAt: pgtype.Timestamptz{Time: time.Now().UTC().Add(circuitHalfOpenProbeLease), Valid: true},
 	})
 	if err != nil {
-		return db.AgentTaskQueue{}, fmt.Errorf("acquire half-open probe: %w", err)
+		return fmt.Errorf("acquire half-open probe: %w", err)
 	}
 	if len(rows) == 0 {
-		return db.AgentTaskQueue{}, errProbeLeaseLost
+		return errProbeLeaseLost
+	}
+	return nil
+}
+
+func (s *AutopilotService) acquireProbeAndCreate(ctx context.Context, q *db.Queries, chosen runtimeCandidate, params db.CreateAutopilotTaskParams) (db.AgentTaskQueue, error) {
+	if err := acquireHalfOpenProbe(ctx, q, chosen, params.ID); err != nil {
+		return db.AgentTaskQueue{}, err
 	}
 	return q.CreateAutopilotTask(ctx, params)
 }
@@ -332,11 +339,10 @@ func poolAllHeldReason(ap db.Autopilot, decision fallbackDecision) string {
 	)
 }
 
-// poolAuthHeldReason phrases the deferral when the primary runtime is held by an
-// auth/access circuit. Unlike a quota hold, this never falls over to a lower
-// binding (F3): the credential must be repaired, so the message names re-auth as
-// the action and surfaces the hold window when known rather than implying a
-// fallback ran.
+// poolAuthHeldReason phrases the deferral when ordered selection reaches an
+// auth/access-held binding before a target. Unlike a quota hold, selection never
+// falls through past auth (F3): the credential must be repaired, so the message
+// names re-auth rather than implying a fallback ran.
 func poolAuthHeldReason(ap db.Autopilot, decision fallbackDecision) string {
 	who := "assignee agent"
 	if ap.AssigneeType == "squad" {
@@ -344,12 +350,12 @@ func poolAuthHeldReason(ap db.Autopilot, decision fallbackDecision) string {
 	}
 	if decision.EarliestKnown {
 		return fmt.Sprintf(
-			"%s: primary runtime held by provider auth/access circuit; no fallback (re-authentication required); hold until %s",
+			"%s: runtime selection reached a provider auth/access circuit; no fallback (re-authentication required); hold until %s",
 			who, decision.EarliestReset.UTC().Format(time.RFC3339),
 		)
 	}
 	return fmt.Sprintf(
-		"%s: primary runtime held by provider auth/access circuit; no fallback, re-authentication required",
+		"%s: runtime selection reached a provider auth/access circuit; no fallback, re-authentication required",
 		who,
 	)
 }

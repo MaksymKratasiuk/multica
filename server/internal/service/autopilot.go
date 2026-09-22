@@ -40,6 +40,10 @@ type AutopilotService struct {
 	TaskSvc      *TaskService
 	Entitlements entitlement.Provider
 	QuotaMetrics AutopilotQuotaMetrics
+	// postCreateIssueFailoverCommentFn is a narrow test seam for the F6
+	// comment-write failure regression. Production leaves it nil and uses the
+	// durable DB writer below.
+	postCreateIssueFailoverCommentFn func(context.Context, db.Autopilot, db.Issue, db.Agent, dispatchRuntimeAudit) error
 }
 
 // DefaultAutopilotTriggerTimezone is the timezone used to render Autopilot
@@ -693,7 +697,11 @@ func (s *AutopilotService) dispatchCreateIssue(ctx context.Context, ap db.Autopi
 	// a single visible system comment records the reassignment.
 	selectedRuntime := leader.RuntimeID
 	fellBack := false
-	var fellBackAudit dispatchRuntimeAudit
+	var chosen runtimeCandidate
+	var routeAudit dispatchRuntimeAudit
+	var routeAuditJSON []byte
+	var routeTaskID pgtype.UUID
+	var routeSummary pgtype.Text
 	if !actorUserID.Valid {
 		decision, firstVerdict, selErr := s.selectPoolRuntime(ctx, leader)
 		if selErr != nil {
@@ -701,12 +709,10 @@ func (s *AutopilotService) dispatchCreateIssue(ctx context.Context, ap db.Autopi
 		}
 		switch decision.Outcome {
 		case fallbackSelected:
+			chosen = decision.Chosen
 			selectedRuntime = decision.Chosen.RuntimeID
 			if selectedRuntime != leader.RuntimeID {
 				fellBack = true
-				fellBackAudit = buildDispatchRuntimeAudit(
-					dispatchAuditReason(true, decision.Chosen),
-					leader.RuntimeID, decision.Chosen, decision.Candidates)
 				slog.Info("autopilot create_issue auto-failover to fallback runtime",
 					"autopilot_id", util.UUIDToString(ap.ID),
 					"run_id", util.UUIDToString(run.ID),
@@ -714,6 +720,24 @@ func (s *AutopilotService) dispatchCreateIssue(ctx context.Context, ap db.Autopi
 					"primary_runtime_id", util.UUIDToString(leader.RuntimeID),
 					"selected_runtime_id", util.UUIDToString(selectedRuntime),
 				)
+			}
+			// F6: both an automatic fallback and a half-open probe carry durable
+			// route evidence on the task plus a visible trigger summary. F4 uses
+			// the pre-allocated ID so a probe lease points at the exact task that
+			// will be enqueued after the issue transaction commits.
+			marker := fallbackRouteMarker(fellBack, chosen)
+			if marker != "" {
+				routeAudit = buildDispatchRuntimeAudit(
+					dispatchAuditReason(fellBack, chosen), leader.RuntimeID, chosen, decision.Candidates)
+				routeAuditJSON, err = json.Marshal(routeAudit)
+				if err != nil {
+					return fmt.Errorf("marshal create_issue dispatch runtime audit: %w", err)
+				}
+				routeTaskID = dbid.NewV7()
+				routeSummary = pgtype.Text{
+					String: runOnlyTriggerSummary(ap.Title, marker),
+					Valid:  ap.Title != "" || marker != "",
+				}
 			}
 		case fallbackEmptyPool:
 			return &errDispatchSkipped{reason: formatAdmissionReason(ap, "agent has no runtime bound"), code: dispatch.ReasonAgentRuntimeRequired}
@@ -744,6 +768,17 @@ func (s *AutopilotService) dispatchCreateIssue(ctx context.Context, ap db.Autopi
 	defer tx.Rollback(ctx)
 
 	qtx := s.Queries.WithTx(tx)
+	if chosen.ProbeWindow {
+		// F4: reserve the runtime-wide probe before creating the issue. The
+		// loser returns while this transaction still contains no issue/task;
+		// rollback releases every partial write. The winner's lease names the
+		// exact task ID passed to the enqueue path below.
+		if err := acquireHalfOpenProbe(ctx, qtx, chosen, routeTaskID); errors.Is(err, errProbeLeaseLost) {
+			return &errDispatchSkipped{reason: formatAdmissionReason(ap, "half-open probe already in flight on selected runtime"), code: dispatch.ReasonDeferred}
+		} else if err != nil {
+			return err
+		}
+	}
 
 	title := s.interpolateTemplate(ap, *run, triggerTimezone)
 	description := s.buildIssueDescription(ap, *run, triggerTimezone)
@@ -901,10 +936,10 @@ func (s *AutopilotService) dispatchCreateIssue(ctx context.Context, ap db.Autopi
 			if _, err := s.TaskSvc.EnqueueTaskForSquadLeaderByActor(ctx, issue, leader.ID, ap.AssigneeID, actorUserID); err != nil {
 				return fmt.Errorf("enqueue squad leader task: %w", err)
 			}
-		} else if fellBack {
+		} else if len(routeAuditJSON) > 0 {
 			// Quota failover: pin the task to the breaker-selected runtime so it
 			// lands where it can actually run, not on the held home runtime.
-			if _, err := s.TaskSvc.EnqueueTaskForSquadLeaderOnRuntime(ctx, issue, leader.ID, ap.AssigneeID, selectedRuntime); err != nil {
+			if _, err := s.TaskSvc.EnqueueTaskForSquadLeaderOnRuntimeWithDispatch(ctx, issue, leader.ID, ap.AssigneeID, selectedRuntime, routeTaskID, routeSummary, routeAuditJSON); err != nil {
 				return fmt.Errorf("enqueue squad leader task: %w", err)
 			}
 		} else if _, err := s.TaskSvc.EnqueueTaskForSquadLeader(ctx, issue, leader.ID, ap.AssigneeID, pgtype.UUID{}, OriginDerived); err != nil {
@@ -914,8 +949,8 @@ func (s *AutopilotService) dispatchCreateIssue(ctx context.Context, ap db.Autopi
 		if _, err := s.TaskSvc.EnqueueTaskForIssueByActor(ctx, issue, actorUserID); err != nil {
 			return fmt.Errorf("enqueue task for issue: %w", err)
 		}
-	} else if fellBack {
-		if _, err := s.TaskSvc.EnqueueTaskForIssueOnRuntime(ctx, issue, selectedRuntime); err != nil {
+	} else if len(routeAuditJSON) > 0 {
+		if _, err := s.TaskSvc.EnqueueTaskForIssueOnRuntimeWithDispatch(ctx, issue, selectedRuntime, routeTaskID, routeSummary, routeAuditJSON); err != nil {
 			return fmt.Errorf("enqueue task for issue: %w", err)
 		}
 	} else if _, err := s.TaskSvc.EnqueueTaskForIssue(ctx, issue); err != nil {
@@ -927,7 +962,17 @@ func (s *AutopilotService) dispatchCreateIssue(ctx context.Context, ap db.Autopi
 	// the source→target runtime failover. A fresh issue+run is created per
 	// dispatch, so exactly one comment per run is inherently idempotent.
 	if fellBack {
-		s.postCreateIssueFailoverComment(ctx, ap, issue, leader, fellBackAudit)
+		post := s.postCreateIssueFailoverComment
+		if s.postCreateIssueFailoverCommentFn != nil {
+			post = s.postCreateIssueFailoverCommentFn
+		}
+		if err := post(ctx, ap, issue, leader, routeAudit); err != nil {
+			slog.Error("autopilot create_issue failover comment failed",
+				"autopilot_id", util.UUIDToString(ap.ID),
+				"issue_id", util.UUIDToString(issue.ID),
+				"error", err,
+			)
+		}
 	}
 
 	slog.Info("autopilot dispatched (create_issue)",
@@ -945,7 +990,7 @@ func (s *AutopilotService) dispatchCreateIssue(ctx context.Context, ap db.Autopi
 // the issue+task are committed, so a failure here is logged, not propagated: the
 // dispatch already succeeded and a missing narration must not undo it. Exactly
 // one comment is written per created issue, which is inherently one per run.
-func (s *AutopilotService) postCreateIssueFailoverComment(ctx context.Context, ap db.Autopilot, issue db.Issue, leader db.Agent, audit dispatchRuntimeAudit) {
+func (s *AutopilotService) postCreateIssueFailoverComment(ctx context.Context, _ db.Autopilot, issue db.Issue, leader db.Agent, audit dispatchRuntimeAudit) error {
 	source := audit.SourceProvider
 	if source == "" {
 		source = "primary runtime"
@@ -968,12 +1013,7 @@ func (s *AutopilotService) postCreateIssueFailoverComment(ctx context.Context, a
 		Type:        "system",
 	})
 	if err != nil {
-		slog.Error("autopilot create_issue failover comment failed",
-			"autopilot_id", util.UUIDToString(ap.ID),
-			"issue_id", util.UUIDToString(issue.ID),
-			"error", err,
-		)
-		return
+		return err
 	}
 	if s.Bus != nil {
 		comment := created.Comment()
@@ -989,6 +1029,7 @@ func (s *AutopilotService) postCreateIssueFailoverComment(ctx context.Context, a
 			},
 		})
 	}
+	return nil
 }
 
 // notifyAutopilotSubscribersOnCreate writes an inbox_item for each template

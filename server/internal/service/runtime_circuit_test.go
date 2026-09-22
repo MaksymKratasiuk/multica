@@ -207,9 +207,10 @@ func TestSelectFallbackRuntime(t *testing.T) {
 		}
 	})
 
-	// F3: an auth/access hold on the PRIMARY never auto-switches to a fallback,
-	// a quota hold does, and an auth hold on a non-primary binding is just a
-	// skipped candidate (only the primary's credential must never be masked).
+	// F3: the first auth/access hold reached before selecting a target never
+	// auto-switches past that binding. A quota hold may fall through, but once
+	// the ordered walk reaches an auth hold it must stop even when that hold is
+	// on a non-primary binding.
 	t.Run("auth hold on primary skips with no fallback", func(t *testing.T) {
 		got := selectFallbackRuntime([]runtimeCandidate{
 			{RuntimeID: uuidFrom(1), Priority: 0, Available: true, Held: true, HeldClass: circuitClassAuth, HoldUntil: now.Add(4 * time.Hour)},
@@ -233,14 +234,17 @@ func TestSelectFallbackRuntime(t *testing.T) {
 		}
 	})
 
-	t.Run("auth hold on a non-primary binding does not block a lower ready one", func(t *testing.T) {
+	t.Run("quota primary then auth secondary stops before healthy tertiary", func(t *testing.T) {
 		got := selectFallbackRuntime([]runtimeCandidate{
 			{RuntimeID: uuidFrom(1), Priority: 0, Available: true, Held: true, HeldClass: circuitClassQuota, HoldUntil: now.Add(time.Hour)},
 			{RuntimeID: uuidFrom(2), Priority: 1, Available: true, Held: true, HeldClass: circuitClassAuth, HoldUntil: now.Add(4 * time.Hour)},
 			{RuntimeID: uuidFrom(3), Priority: 2, Available: true, Held: false},
 		})
-		if got.Outcome != fallbackSelected || got.Chosen.RuntimeID != uuidFrom(3) {
-			t.Fatalf("unexpected: %+v, want selected priority-2", got)
+		if got.Outcome != fallbackAuthHeld {
+			t.Fatalf("unexpected: %+v, want auth-held stop before priority-2", got)
+		}
+		if !got.EarliestKnown || !got.EarliestReset.Equal(now.Add(4*time.Hour)) {
+			t.Fatalf("auth hold reset = %v known=%v, want %s", got.EarliestReset, got.EarliestKnown, now.Add(4*time.Hour))
 		}
 	})
 

@@ -196,4 +196,24 @@ func TestSelectPoolRuntimeAgainstDB(t *testing.T) {
 			t.Fatalf("outcome=%v chosen=%s, want selected r1=%s (quota falls through)", decision.Outcome, util.UUIDToString(decision.Chosen.RuntimeID), r1)
 		}
 	})
+
+	t.Run("quota primary then auth secondary stops before healthy tertiary", func(t *testing.T) {
+		r0 := insertRuntimeForBindingTeardown(t, pool, workspaceID, userID, "G r0")
+		r1 := insertRuntimeForBindingTeardown(t, pool, workspaceID, userID, "G r1")
+		r2 := insertRuntimeForBindingTeardown(t, pool, workspaceID, userID, "G r2")
+		agent := insertAgentForBindingTeardown(t, pool, workspaceID, userID, "agent G", r0)
+		insertBinding(t, pool, workspaceID, agent, r0, 0)
+		insertBinding(t, pool, workspaceID, agent, r1, 1)
+		insertBinding(t, pool, workspaceID, agent, r2, 2)
+		insertCircuitReason(r0, "open", circuitClassQuota, future)
+		insertCircuitReason(r1, "open", circuitClassAuth, future.Add(2*time.Hour))
+
+		decision, _, err := svc.selectPoolRuntime(ctx, agentRow(agent))
+		if err != nil {
+			t.Fatalf("selectPoolRuntime: %v", err)
+		}
+		if decision.Outcome != fallbackAuthHeld {
+			t.Fatalf("outcome=%v chosen=%s, want auth-held stop before healthy r2=%s", decision.Outcome, util.UUIDToString(decision.Chosen.RuntimeID), r2)
+		}
+	})
 }

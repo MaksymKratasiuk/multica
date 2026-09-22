@@ -1138,12 +1138,49 @@ func enqueueRuntime(agent db.Agent, override pgtype.UUID) pgtype.UUID {
 	return agent.RuntimeID
 }
 
+// taskDispatchRoute carries the automatic Autopilot routing evidence that must
+// be inserted with a create_issue task (SE-37873 F4/F6). Ordinary issue and
+// mention enqueues pass no route and keep their existing ID/summary/audit.
+type taskDispatchRoute struct {
+	TaskID               pgtype.UUID
+	TriggerSummary       pgtype.Text
+	DispatchRuntimeAudit []byte
+}
+
+func resolveTaskDispatchRoute(defaultSummary pgtype.Text, routes []taskDispatchRoute) (pgtype.UUID, pgtype.Text, []byte) {
+	taskID := dbid.NewV7()
+	if len(routes) == 0 {
+		return taskID, defaultSummary, nil
+	}
+	route := routes[0]
+	if route.TaskID.Valid {
+		taskID = route.TaskID
+	}
+	if route.TriggerSummary.Valid {
+		defaultSummary = route.TriggerSummary
+	}
+	return taskID, defaultSummary, route.DispatchRuntimeAudit
+}
+
 // EnqueueTaskForIssueOnRuntime is EnqueueTaskForIssue with the task pinned to a
 // breaker-selected fallback runtime. dispatchCreateIssue uses it on the
 // scheduled/webhook path when the agent's home runtime is quota-held, so the
 // created issue's task lands on a runtime that can actually run it (F5).
 func (s *TaskService) EnqueueTaskForIssueOnRuntime(ctx context.Context, issue db.Issue, runtimeOverride pgtype.UUID) (db.AgentTaskQueue, error) {
 	return s.enqueueIssueTaskWithCommentPlan(ctx, issue, pgtype.UUID{}, nil, false, "", pgtype.UUID{}, pgtype.UUID{}, pgtype.Timestamptz{}, OriginDerived, runtimeOverride)
+}
+
+// EnqueueTaskForIssueOnRuntimeWithDispatch is the automatic create_issue
+// fallback/probe variant. The caller pre-allocates taskID when a half-open lease
+// must point at the exact task, and the structured route audit is persisted by
+// the same INSERT as the task so a failed narration comment cannot make routing
+// silent (F4/F6).
+func (s *TaskService) EnqueueTaskForIssueOnRuntimeWithDispatch(ctx context.Context, issue db.Issue, runtimeOverride, taskID pgtype.UUID, triggerSummary pgtype.Text, audit []byte) (db.AgentTaskQueue, error) {
+	return s.enqueueIssueTaskWithCommentPlan(ctx, issue, pgtype.UUID{}, nil, false, "", pgtype.UUID{}, pgtype.UUID{}, pgtype.Timestamptz{}, OriginDerived, runtimeOverride, taskDispatchRoute{
+		TaskID:               taskID,
+		TriggerSummary:       triggerSummary,
+		DispatchRuntimeAudit: audit,
+	})
 }
 
 // EnqueueDeferredChannelIssueTask persists the assigned task for a media-backed
@@ -1269,7 +1306,7 @@ func (s *TaskService) enqueueIssueTask(ctx context.Context, issue db.Issue, trig
 	return s.enqueueIssueTaskWithCommentPlan(ctx, issue, triggerCommentID, nil, forceFreshSession, handoffNote, actorUserID, rerunOfTaskID, fireAt, origin, pgtype.UUID{})
 }
 
-func (s *TaskService) enqueueIssueTaskWithCommentPlan(ctx context.Context, issue db.Issue, triggerCommentID pgtype.UUID, coalescedCommentIDs []pgtype.UUID, forceFreshSession bool, handoffNote string, actorUserID pgtype.UUID, rerunOfTaskID pgtype.UUID, fireAt pgtype.Timestamptz, origin RunOrigin, runtimeOverride pgtype.UUID) (db.AgentTaskQueue, error) {
+func (s *TaskService) enqueueIssueTaskWithCommentPlan(ctx context.Context, issue db.Issue, triggerCommentID pgtype.UUID, coalescedCommentIDs []pgtype.UUID, forceFreshSession bool, handoffNote string, actorUserID pgtype.UUID, rerunOfTaskID pgtype.UUID, fireAt pgtype.Timestamptz, origin RunOrigin, runtimeOverride pgtype.UUID, routes ...taskDispatchRoute) (db.AgentTaskQueue, error) {
 	if !issue.AssigneeID.Valid {
 		slog.Error("task enqueue failed", "issue_id", util.UUIDToString(issue.ID), "error", "issue has no assignee")
 		return db.AgentTaskQueue{}, fmt.Errorf("issue has no assignee")
@@ -1308,15 +1345,18 @@ func (s *TaskService) enqueueIssueTaskWithCommentPlan(ctx context.Context, issue
 	originatorUserID := attr.UserID
 	runtimeMCPOverlay := s.buildRuntimeMCPOverlay(ctx, originatorUserID, agent)
 	attrSource, attrDelegatedFrom, attrEvidenceKind, attrEvidenceRef := attributionCreateParams(attr)
+	taskID, triggerSummary, dispatchAudit := resolveTaskDispatchRoute(
+		s.buildCommentTriggerSummary(ctx, issue.WorkspaceID, triggerCommentID), routes)
 	createParams := db.CreateAgentTaskParams{
-		ID:                   dbid.NewV7(),
+		ID:                   taskID,
 		AgentID:              issue.AssigneeID,
 		RuntimeID:            enqueueRuntime(agent, runtimeOverride),
 		IssueID:              issue.ID,
 		Priority:             priorityToInt(issue.Priority),
 		TriggerCommentID:     triggerCommentID,
 		CoalescedCommentIds:  coalescedCommentIDs,
-		TriggerSummary:       s.buildCommentTriggerSummary(ctx, issue.WorkspaceID, triggerCommentID),
+		TriggerSummary:       triggerSummary,
+		DispatchRuntimeAudit: dispatchAudit,
 		ForceFreshSession:    pgtype.Bool{Bool: forceFreshSession, Valid: forceFreshSession},
 		HandoffNote:          pgtype.Text{String: handoffNote, Valid: handoffNote != ""},
 		OriginatorUserID:     originatorUserID,
@@ -1435,6 +1475,16 @@ func (s *TaskService) EnqueueTaskForSquadLeaderOnRuntime(ctx context.Context, is
 	return s.enqueueMentionTaskWithCommentPlan(ctx, issue, leaderID, pgtype.UUID{}, nil, true, squadID, false, "", pgtype.UUID{}, pgtype.UUID{}, OriginDerived, runtimeOverride)
 }
 
+// EnqueueTaskForSquadLeaderOnRuntimeWithDispatch is the squad counterpart of
+// EnqueueTaskForIssueOnRuntimeWithDispatch.
+func (s *TaskService) EnqueueTaskForSquadLeaderOnRuntimeWithDispatch(ctx context.Context, issue db.Issue, leaderID, squadID, runtimeOverride, taskID pgtype.UUID, triggerSummary pgtype.Text, audit []byte) (db.AgentTaskQueue, error) {
+	return s.enqueueMentionTaskWithCommentPlan(ctx, issue, leaderID, pgtype.UUID{}, nil, true, squadID, false, "", pgtype.UUID{}, pgtype.UUID{}, OriginDerived, runtimeOverride, taskDispatchRoute{
+		TaskID:               taskID,
+		TriggerSummary:       triggerSummary,
+		DispatchRuntimeAudit: audit,
+	})
+}
+
 // EnqueueTaskForSquadLeaderByActor is the assign/promote variant of
 // EnqueueTaskForSquadLeader. actorUserID is the member who performed the
 // assign/promote and becomes the accountable human (MUL-4302 §4); invalid when
@@ -1453,7 +1503,7 @@ func (s *TaskService) enqueueMentionTask(ctx context.Context, issue db.Issue, ag
 	return s.enqueueMentionTaskWithCommentPlan(ctx, issue, agentID, triggerCommentID, nil, isLeader, squadID, forceFreshSession, handoffNote, actorUserID, rerunOfTaskID, origin, pgtype.UUID{})
 }
 
-func (s *TaskService) enqueueMentionTaskWithCommentPlan(ctx context.Context, issue db.Issue, agentID pgtype.UUID, triggerCommentID pgtype.UUID, coalescedCommentIDs []pgtype.UUID, isLeader bool, squadID pgtype.UUID, forceFreshSession bool, handoffNote string, actorUserID pgtype.UUID, rerunOfTaskID pgtype.UUID, origin RunOrigin, runtimeOverride pgtype.UUID) (db.AgentTaskQueue, error) {
+func (s *TaskService) enqueueMentionTaskWithCommentPlan(ctx context.Context, issue db.Issue, agentID pgtype.UUID, triggerCommentID pgtype.UUID, coalescedCommentIDs []pgtype.UUID, isLeader bool, squadID pgtype.UUID, forceFreshSession bool, handoffNote string, actorUserID pgtype.UUID, rerunOfTaskID pgtype.UUID, origin RunOrigin, runtimeOverride pgtype.UUID, routes ...taskDispatchRoute) (db.AgentTaskQueue, error) {
 	if err := guardIssueNotInTriage(ctx, s.Queries, issue.ID, origin); err != nil {
 		return db.AgentTaskQueue{}, err
 	}
@@ -1486,15 +1536,18 @@ func (s *TaskService) enqueueMentionTaskWithCommentPlan(ctx context.Context, iss
 	originatorUserID := attr.UserID
 	runtimeMCPOverlay := s.buildRuntimeMCPOverlay(ctx, originatorUserID, agent)
 	attrSource, attrDelegatedFrom, attrEvidenceKind, attrEvidenceRef := attributionCreateParams(attr)
+	taskID, triggerSummary, dispatchAudit := resolveTaskDispatchRoute(
+		s.buildCommentTriggerSummary(ctx, issue.WorkspaceID, triggerCommentID), routes)
 	task, err := s.Queries.CreateAgentTask(ctx, db.CreateAgentTaskParams{
-		ID:                   dbid.NewV7(),
+		ID:                   taskID,
 		AgentID:              agentID,
 		RuntimeID:            enqueueRuntime(agent, runtimeOverride),
 		IssueID:              issue.ID,
 		Priority:             priorityToInt(issue.Priority),
 		TriggerCommentID:     triggerCommentID,
 		CoalescedCommentIds:  coalescedCommentIDs,
-		TriggerSummary:       s.buildCommentTriggerSummary(ctx, issue.WorkspaceID, triggerCommentID),
+		TriggerSummary:       triggerSummary,
+		DispatchRuntimeAudit: dispatchAudit,
 		IsLeaderTask:         pgtype.Bool{Bool: isLeader, Valid: isLeader},
 		ForceFreshSession:    pgtype.Bool{Bool: forceFreshSession, Valid: forceFreshSession},
 		HandoffNote:          pgtype.Text{String: handoffNote, Valid: handoffNote != ""},

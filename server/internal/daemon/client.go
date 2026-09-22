@@ -570,11 +570,10 @@ func (c *Client) ReportTaskUsage(ctx context.Context, taskID string, usage []Tas
 }
 
 // ReportTaskDispatchModelAction forwards the daemon-side model fail-safe outcome
-// (SE-37741 F8: kept/qualified/cleared) so the server can enrich a runtime
-// failover audit (F6) with it. Reported independently of complete/fail — the
-// model is resolved at pickup, before the agent runs — and only when the action
-// changed the pin. The server-side merge is a no-op unless this task carries a
-// failover audit, so a lost report only drops enrichment, never correctness.
+// (SE-37741/SE-37873 F8: kept/qualified/cleared) so the server can enrich a
+// runtime failover audit (F6) with it. Reported independently of complete/fail —
+// the model is resolved at pickup, before the agent runs. The caller fails an
+// audited route closed when this durable write is unavailable.
 func (c *Client) ReportTaskDispatchModelAction(ctx context.Context, taskID, modelAction string) error {
 	if modelAction == "" {
 		return nil
