@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	obsmetrics "github.com/multica-ai/multica/server/internal/metrics"
@@ -250,8 +251,9 @@ func TestTaskRetentionAgeBoundary(t *testing.T) {
 
 // TestTaskRetentionOnlyTerminalStatuses proves the status-specific predicates:
 // the failed sweep touches only failed rows and the completed sweep only
-// completed rows; queued/running/cancelled/dispatched all survive regardless of
-// age.
+// completed rows; every other current status survives regardless of age. It
+// also proves the two historical/non-schema literals are rejected by the
+// status CHECK rather than silently entering the retention matrix.
 func TestTaskRetentionOnlyTerminalStatuses(t *testing.T) {
 	requireDBTest(t)
 	env := newRetentionEnv(t)
@@ -261,10 +263,28 @@ func TestTaskRetentionOnlyTerminalStatuses(t *testing.T) {
 		failed := env.insertTask(t, ctx, tx, "failed", old)
 		completed := env.insertTask(t, ctx, tx, "completed", old)
 		survivors := map[string]string{
-			"queued":     env.insertTask(t, ctx, tx, "queued", old),
-			"running":    env.insertTask(t, ctx, tx, "running", old),
-			"cancelled":  env.insertTask(t, ctx, tx, "cancelled", old),
-			"dispatched": env.insertTask(t, ctx, tx, "dispatched", old),
+			"queued":                  env.insertTask(t, ctx, tx, "queued", old),
+			"dispatched":              env.insertTask(t, ctx, tx, "dispatched", old),
+			"running":                 env.insertTask(t, ctx, tx, "running", old),
+			"waiting_local_directory": env.insertTask(t, ctx, tx, "waiting_local_directory", old),
+			"deferred":                env.insertTask(t, ctx, tx, "deferred", old),
+			"cancelled":               env.insertTask(t, ctx, tx, "cancelled", old),
+		}
+		for _, status := range []string{"in_progress", "pending"} {
+			savepoint, err := tx.Begin(ctx)
+			if err != nil {
+				t.Fatalf("begin savepoint for rejected status %q: %v", status, err)
+			}
+			_, insertErr := savepoint.Exec(ctx,
+				"INSERT INTO agent_task_queue (agent_id, runtime_id, status, priority, completed_at) VALUES ($1, $2, $3, 0, "+old+")",
+				env.agentID, env.runtimeID, status)
+			if err := savepoint.Rollback(ctx); err != nil {
+				t.Fatalf("rollback rejected status %q: %v", status, err)
+			}
+			var pgErr *pgconn.PgError
+			if !errors.As(insertErr, &pgErr) || pgErr.Code != "23514" || pgErr.ConstraintName != "agent_task_queue_status_check" {
+				t.Errorf("status %q insert error = %v, want CHECK violation from agent_task_queue_status_check", status, insertErr)
+			}
 		}
 
 		fids, err := qtx.DeleteFailedTaskRetentionBatch(ctx, db.DeleteFailedTaskRetentionBatchParams{
@@ -833,20 +853,35 @@ func TestTaskRetentionBatchFailureRollsBackAndResumes(t *testing.T) {
 	}
 }
 
-// TestTaskRetentionDeleteCascadesUsageAndEnqueuesDirty proves the delete's two
-// dependent effects: task_usage rows cascade away (FK ON DELETE CASCADE,
-// migration 032), and the BEFORE DELETE trigger (migration 102/243) enqueues an
-// hourly-dirty row so the usage rollup re-derives the vanished usage.
-func TestTaskRetentionDeleteCascadesUsageAndEnqueuesDirty(t *testing.T) {
+// TestTaskRetentionDeleteAppliesForeignKeyEffectsAndEnqueuesDirty proves every
+// agent_task_queue FK effect the retention delete relies on: task_message,
+// task_usage, and task_token cascade away; terminal children, old autopilot
+// runs, and Lark outbound cards survive with their task reference set to NULL.
+// It also proves the usage delete still enqueues an hourly-dirty recompute.
+func TestTaskRetentionDeleteAppliesForeignKeyEffectsAndEnqueuesDirty(t *testing.T) {
 	requireDBTest(t)
 	env := newRetentionEnv(t)
+	chatSessionID := env.fx.ChatSession(t, env.agentID)
 
 	env.withRetentionTx(t, func(ctx context.Context, tx pgx.Tx, qtx *db.Queries, asOf pgtype.Timestamptz, iso string) {
 		taskID := env.insertTask(t, ctx, tx, "failed", agedExpr(iso, retentionFarPastDays))
 		const model = "task-retention-cascade-model"
 		execID(t, ctx, tx,
+			"INSERT INTO task_message (task_id, seq, type, content) VALUES ($1, 1, 'assistant', 'retention cascade proof') RETURNING id",
+			taskID)
+		execID(t, ctx, tx,
 			"INSERT INTO task_usage (task_id, provider, model, output_tokens) VALUES ($1, 'test-provider', $2, 7) RETURNING id",
 			taskID, model)
+		execID(t, ctx, tx,
+			"INSERT INTO task_token (token_hash, task_id, agent_id, workspace_id, user_id, expires_at) VALUES ($1, $2, $3, $4, $5, now() + interval '1 hour') RETURNING id",
+			"task-retention-"+taskID, taskID, env.agentID, testWorkspaceID, testUserID)
+		childID := execID(t, ctx, tx,
+			"INSERT INTO agent_task_queue (agent_id, runtime_id, status, priority, completed_at, parent_task_id) VALUES ($1, $2, 'cancelled', 0, now(), $3) RETURNING id",
+			env.agentID, env.runtimeID, taskID)
+		runID := env.insertRun(t, ctx, tx, "completed", agedExpr(iso, retentionFarPastDays), &taskID)
+		cardID := execID(t, ctx, tx,
+			"INSERT INTO lark_outbound_card_message (chat_session_id, task_id, lark_chat_id, lark_card_message_id, status) VALUES ($1, $2, 'retention-chat', 'retention-card', 'final') RETURNING id",
+			chatSessionID, taskID)
 
 		ids, err := qtx.DeleteFailedTaskRetentionBatch(ctx, db.DeleteFailedTaskRetentionBatchParams{
 			AsOf: asOf, FailedDays: 30, BatchSize: taskRetentionMaxBatchSize,
@@ -858,18 +893,45 @@ func TestTaskRetentionDeleteCascadesUsageAndEnqueuesDirty(t *testing.T) {
 			t.Fatalf("aged failed task with usage was not deleted")
 		}
 
-		var taskCount, usageCount, dirtyCount int
+		var taskCount, dirtyCount int
 		if err := tx.QueryRow(ctx, "SELECT count(*) FROM agent_task_queue WHERE id = $1", taskID).Scan(&taskCount); err != nil {
 			t.Fatalf("count task: %v", err)
 		}
 		if taskCount != 0 {
 			t.Errorf("task row survived delete (count=%d)", taskCount)
 		}
-		if err := tx.QueryRow(ctx, "SELECT count(*) FROM task_usage WHERE task_id = $1", taskID).Scan(&usageCount); err != nil {
-			t.Fatalf("count usage: %v", err)
+		for _, dependent := range []struct {
+			name  string
+			query string
+		}{
+			{name: "task_message", query: "SELECT count(*) FROM task_message WHERE task_id = $1"},
+			{name: "task_usage", query: "SELECT count(*) FROM task_usage WHERE task_id = $1"},
+			{name: "task_token", query: "SELECT count(*) FROM task_token WHERE task_id = $1"},
+		} {
+			var count int
+			if err := tx.QueryRow(ctx, dependent.query, taskID).Scan(&count); err != nil {
+				t.Fatalf("count %s: %v", dependent.name, err)
+			}
+			if count != 0 {
+				t.Errorf("%s row not cascade-deleted (count=%d)", dependent.name, count)
+			}
 		}
-		if usageCount != 0 {
-			t.Errorf("task_usage row not cascade-deleted (count=%d)", usageCount)
+		for _, dependent := range []struct {
+			name  string
+			query string
+			id    string
+		}{
+			{name: "terminal child", query: "SELECT count(*) FROM agent_task_queue WHERE id = $1 AND parent_task_id IS NULL", id: childID},
+			{name: "old autopilot run", query: "SELECT count(*) FROM autopilot_run WHERE id = $1 AND task_id IS NULL", id: runID},
+			{name: "Lark outbound card", query: "SELECT count(*) FROM lark_outbound_card_message WHERE id = $1 AND task_id IS NULL", id: cardID},
+		} {
+			var count int
+			if err := tx.QueryRow(ctx, dependent.query, dependent.id).Scan(&count); err != nil {
+				t.Fatalf("count %s: %v", dependent.name, err)
+			}
+			if count != 1 {
+				t.Errorf("%s did not survive with a NULL task reference (matching rows=%d)", dependent.name, count)
+			}
 		}
 		if err := tx.QueryRow(ctx,
 			"SELECT count(*) FROM task_usage_hourly_dirty WHERE runtime_id = $1 AND agent_id = $2 AND model = $3",
@@ -936,41 +998,77 @@ func TestTaskRetentionDryRunCandidateParity(t *testing.T) {
 	})
 }
 
-// TestTaskRetentionPlanUsesTerminalIndex proves the failed-candidate predicate
-// is served by migration 261's partial index
-// (idx_agent_task_queue_terminal_completed_at_v2) rather than a full-table scan,
-// which is what keeps the sweep from scanning the whole lifetime table.
-func TestTaskRetentionPlanUsesTerminalIndex(t *testing.T) {
+// TestTaskRetentionPlansUseTerminalIndex proves both status-specific candidate
+// query shapes, including their guards/order/limit and distinct age thresholds,
+// can use migration 261's terminal completed_at partial index.
+func TestTaskRetentionPlansUseTerminalIndex(t *testing.T) {
 	requireDBTest(t)
 	env := newRetentionEnv(t)
 
-	env.withRetentionTx(t, func(ctx context.Context, tx pgx.Tx, qtx *db.Queries, asOf pgtype.Timestamptz, iso string) {
+	env.withRetentionTx(t, func(ctx context.Context, tx pgx.Tx, _ *db.Queries, asOf pgtype.Timestamptz, _ string) {
 		// A small test table can make a seq scan look cheapest; disabling it
 		// asserts the index is usable at all, which is the property that matters
 		// at production scale.
 		if _, err := tx.Exec(ctx, "SET LOCAL enable_seqscan = off"); err != nil {
 			t.Fatalf("disable seqscan: %v", err)
 		}
-		rows, err := tx.Query(ctx,
-			"EXPLAIN SELECT id FROM agent_task_queue WHERE status = 'failed' AND completed_at IS NOT NULL AND completed_at < now() - make_interval(days => 30)")
-		if err != nil {
-			t.Fatalf("explain: %v", err)
-		}
-		defer rows.Close()
-		var plan strings.Builder
-		for rows.Next() {
-			var line string
-			if err := rows.Scan(&line); err != nil {
-				t.Fatalf("scan plan line: %v", err)
-			}
-			plan.WriteString(line)
-			plan.WriteByte('\n')
-		}
-		if err := rows.Err(); err != nil {
-			t.Fatalf("plan rows: %v", err)
-		}
-		if !strings.Contains(plan.String(), "idx_agent_task_queue_terminal_completed_at_v2") {
-			t.Errorf("failed-candidate query did not use the terminal completed_at index; plan:\n%s", plan.String())
+		for _, tc := range []struct {
+			status string
+			days   int
+		}{
+			{status: "failed", days: 30},
+			{status: "completed", days: 90},
+		} {
+			t.Run(tc.status, func(t *testing.T) {
+				rows, err := tx.Query(ctx, fmt.Sprintf(`
+EXPLAIN (COSTS OFF)
+SELECT t.id
+FROM agent_task_queue t
+WHERE t.status = '%s'
+  AND t.completed_at IS NOT NULL
+  AND t.completed_at < $1::timestamptz - make_interval(days => $2::int)
+  AND NOT EXISTS (
+      SELECT 1 FROM autopilot_run ar
+      WHERE ar.task_id = t.id
+        AND (ar.status IN ('issue_created', 'running')
+             OR ar.created_at >= $1::timestamptz - interval '7 days')
+  )
+  AND NOT EXISTS (
+      SELECT 1 FROM autopilot_run ar
+      WHERE ar.id = t.autopilot_run_id
+        AND (ar.status IN ('issue_created', 'running')
+             OR ar.created_at >= $1::timestamptz - interval '7 days')
+  )
+  AND NOT EXISTS (
+      SELECT 1 FROM agent_task_queue child
+      WHERE child.parent_task_id = t.id
+        AND child.status IN ('queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred')
+  )
+ORDER BY t.completed_at ASC, t.id ASC
+LIMIT $3::int
+FOR UPDATE OF t SKIP LOCKED`, tc.status), asOf, tc.days, taskRetentionMaxBatchSize)
+				if err != nil {
+					t.Fatalf("explain %s candidates: %v", tc.status, err)
+				}
+				var plan strings.Builder
+				for rows.Next() {
+					var line string
+					if err := rows.Scan(&line); err != nil {
+						rows.Close()
+						t.Fatalf("scan %s plan line: %v", tc.status, err)
+					}
+					plan.WriteString(line)
+					plan.WriteByte('\n')
+				}
+				if err := rows.Err(); err != nil {
+					rows.Close()
+					t.Fatalf("%s plan rows: %v", tc.status, err)
+				}
+				rows.Close()
+				if !strings.Contains(plan.String(), "idx_agent_task_queue_terminal_completed_at_v2") {
+					t.Errorf("%s/%dd candidate query did not use the terminal completed_at index; plan:\n%s", tc.status, tc.days, plan.String())
+				}
+			})
 		}
 	})
 }
